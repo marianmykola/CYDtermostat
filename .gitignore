@@ -1,0 +1,35 @@
+# PlatformIO
+.pio/
+.vscode/
+*.tmp
+*.bak
+
+# Build
+lib/readme.txt
+include/readme.txt
+
+# IDE
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment files
+.env
+*.env
+
+# Debug
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Configuration files with sensitive data
+config.h
+secrets.h
