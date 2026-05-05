@@ -201,55 +201,97 @@ void drawHomeScreen() {
   tft.fillScreen(TFT_BLACK);
   drawStatusBar();
   
-  // Title
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(2);
-  tft.drawString("Smart Thermostat", 70, 10);
+  // Main temperature card - large and prominent
+  int cardX = 15, cardY = 35, cardWidth = 290, cardHeight = 100;
   
-  // Current temperature display with better label
+  // Card background with gradient effect
+  tft.fillRoundRect(cardX, cardY, cardWidth, cardHeight, 10, TFT_DARKGREY);
+  tft.drawRoundRect(cardX, cardY, cardWidth, cardHeight, 10, TFT_CYAN);
+  
+  // Current temperature - very large and centered
   tft.setTextColor(TFT_CYAN);
-  tft.setTextSize(4);
-  tft.drawString(String(currentTemp, 1) + "C", 100, 50);
+  tft.setTextSize(7);
+  String tempStr = String(currentTemp, 1) + "C";
+  int tempWidth = tft.textWidth(tempStr);
+  tft.drawString(tempStr, (SCREEN_WIDTH - tempWidth) / 2, cardY + 25);
   
-  tft.setTextColor(TFT_LIGHTGREY);
-  tft.setTextSize(1);
-  tft.drawString("Inside", 140, 60);
-  
-  // Target temperature display
-  tft.setTextColor(TFT_GREEN);
-  tft.setTextSize(2);
-  tft.drawString("Target: " + String(targetTemp, 1) + "C", 20, 110);
-  
-  // Temperature control buttons
-  tft.fillRect(220, 100, 40, 30, TFT_BLUE);
-  tft.fillRect(270, 100, 40, 30, TFT_RED);
+  // Inside label with icon
+  tft.fillCircle(cardX + 15, cardY + 15, 4, TFT_CYAN);
   tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(2);
-  tft.drawString("+", 235, 108);
-  tft.drawString("-", 285, 108);
-  
-  // Weather section
-  tft.setTextColor(TFT_LIGHTGREY);
   tft.setTextSize(1);
-  tft.drawString("Outdoor", 20, 150);
+  tft.drawString("INSIDE TEMPERATURE", cardX + 25, cardY + 11);
   
+  // Target temperature card
+  int targetCardX = 15, targetCardY = 145, targetCardWidth = 180, targetCardHeight = 60;
+  tft.fillRoundRect(targetCardX, targetCardY, targetCardWidth, targetCardHeight, 8, TFT_NAVY);
+  tft.drawRoundRect(targetCardX, targetCardY, targetCardWidth, targetCardHeight, 8, TFT_GREEN);
+  
+  // Target label
+  tft.setTextColor(TFT_GREEN);
+  tft.setTextSize(1);
+  tft.drawString("TARGET", targetCardX + 10, targetCardY + 8);
+  
+  // Target temperature value
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(4);
+  tft.drawString(String(targetTemp, 1) + "C", targetCardX + 10, targetCardY + 22);
+  
+  // Temperature control buttons - large square buttons
+  // Plus button - large square
+  tft.fillRect(targetCardX + 110, targetCardY + 15, 35, 35, TFT_BLUE);
+  tft.drawRect(targetCardX + 110, targetCardY + 15, 35, 35, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(4);
+  tft.drawString("+", targetCardX + 120, targetCardY + 22);
+  
+  // Minus button - large square
+  tft.fillRect(targetCardX + 155, targetCardY + 15, 35, 35, TFT_RED);
+  tft.drawRect(targetCardX + 155, targetCardY + 15, 35, 35, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(4);
+  tft.drawString("-", targetCardX + 165, targetCardY + 22);
+  
+  // Weather card
+  int weatherCardX = 205, weatherCardY = 145, weatherCardWidth = 100, weatherCardHeight = 60;
+  tft.fillRoundRect(weatherCardX, weatherCardY, weatherCardWidth, weatherCardHeight, 8, TFT_DARKGREY);
+  tft.drawRoundRect(weatherCardX, weatherCardY, weatherCardWidth, weatherCardHeight, 8, TFT_ORANGE);
+  
+  // Outdoor label with icon
+  tft.fillCircle(weatherCardX + 8, weatherCardY + 8, 3, TFT_ORANGE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+  tft.drawString("OUTDOOR", weatherCardX + 15, weatherCardY + 5);
+  
+  // Outdoor temperature
   tft.setTextColor(TFT_ORANGE);
-  tft.setTextSize(2);
-  tft.drawString(String(outdoorTemp, 1) + "C", 20, 170);
+  tft.setTextSize(3);
+  tft.drawString(String(outdoorTemp, 1) + "C", weatherCardX + 8, weatherCardY + 20);
   
+  // Weather description
   tft.setTextColor(TFT_LIGHTGREY);
   tft.setTextSize(1);
-  tft.drawString(weatherDescription, 100, 175);
+  String shortDesc = weatherDescription.substring(0, 8);
+  tft.drawString(shortDesc, weatherCardX + 8, weatherCardY + 45);
   
-  // Draw weather icon
-  drawWeatherIcon(250, 160, weatherIcon);
+  // Weather icon
+  drawWeatherIcon(weatherCardX + 70, weatherCardY + 15, weatherIcon);
   
-  // Draw settings button
+  // Status bar at bottom
+  tft.drawFastHLine(0, 215, SCREEN_WIDTH, TFT_DARKGREY);
+  
+  // Status indicators
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextSize(1);
+  tft.drawString("● Heating: " + String(heatingOn ? "ON" : "OFF"), 20, 220);
+  tft.drawString("● WiFi: " + String(isConnected ? "Connected" : "Disconnected"), 150, 220);
+  
+  // Settings button - modern style
   for (const auto& btn : homeButtons) {
-    tft.fillRect(btn.x, btn.y, btn.width, btn.height, btn.color);
+    tft.fillRoundRect(btn.x, btn.y, btn.width, btn.height, 8, btn.color);
+    tft.drawRoundRect(btn.x, btn.y, btn.width, btn.height, 8, TFT_WHITE);
     tft.setTextColor(TFT_WHITE);
     tft.setTextSize(1);
-    tft.drawString(btn.text, btn.x + 5, btn.y + btn.height/2 - 8);
+    tft.drawString(btn.text, btn.x + 10, btn.y + btn.height/2 - 8);
   }
 }
 
@@ -361,14 +403,31 @@ void checkTouch() {
 
 void handleHomeTouch(int x, int y) {
   // Check temperature control buttons first
-  if (x >= 220 && x <= 260 && y >= 100 && y <= 130) {
+  // Plus button - square at (125, 160) size 35x35 (targetCardX + 110, targetCardY + 15)
+  int plusX = 125, plusY = 160, plusSize = 35;
+  int minusX = 170, minusY = 160, minusSize = 35;
+  
+  // Plus button - square
+  if (x >= plusX && x <= plusX + plusSize && y >= plusY && y <= plusY + plusSize) {
     increaseTargetTemp();
     return;
   }
   
-  if (x >= 270 && x <= 310 && y >= 100 && y <= 130) {
+  // Minus button - square
+  if (x >= minusX && x <= minusX + minusSize && y >= minusY && y <= minusY + minusSize) {
     decreaseTargetTemp();
     return;
+  }
+  
+  // Check menu buttons
+  for (const auto& btn : homeButtons) {
+    if (x >= btn.x && x <= btn.x + btn.width &&
+        y >= btn.y && y <= btn.y + btn.height) {
+      if (btn.action) {
+        btn.action();
+      }
+      break;
+    }
   }
 }
 
@@ -397,27 +456,55 @@ void handleSettingsTouch(int x, int y) {
 }
 
 void setupWiFi() {
-  // Configure static IP
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("STA Failed to configure");
-  }
+  Serial.println("=== WiFi Setup Starting ===");
   
-  // Connect to WiFi using WiFiManager
-  Serial.println("Starting WiFiManager...");
+  // Reset WiFi settings for testing (comment out for production)
+  // wm.resetSettings();
   
   // Set custom AP name and password
   wm.setConfigPortalTimeout(300); // 5 minutes timeout
+  wm.setAPStaticIPConfig(local_IP, gateway, subnet);
   
-  if (!wm.autoConnect("ESP32_Config", "12345678")) {
-    Serial.println("Failed to connect and hit timeout");
-    ESP.restart();
-    delay(1000);
+  // Add debug output
+  wm.setDebugOutput(true);
+  
+  Serial.println("Starting WiFiManager...");
+  Serial.println("AP Name: ESP32_Config");
+  Serial.println("AP Password: 12345678");
+  
+  // First try to connect to saved WiFi
+  if (wm.autoConnect("ESP32_Config", "12345678")) {
+    Serial.println("=== WiFi Connected Successfully ===");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("Signal strength (RSSI): ");
+    Serial.println(WiFi.RSSI());
+    
+    isConnected = true;
+  } else {
+    Serial.println("Failed to connect, starting config portal...");
+    
+    // Start config portal manually
+    if (wm.startConfigPortal("ESP32_Config", "12345678")) {
+      Serial.println("=== WiFi Connected via Portal ===");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("SSID: ");
+      Serial.println(WiFi.SSID());
+      
+      isConnected = true;
+    } else {
+      Serial.println("Failed to connect or timed out");
+      Serial.println("Restarting ESP32...");
+      delay(1000);
+      ESP.restart();
+    }
   }
   
-  Serial.println("WiFi connected!");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  isConnected = true;
+  // Update status bar
+  drawStatusBar();
 }
 
 void readTemperature() {
