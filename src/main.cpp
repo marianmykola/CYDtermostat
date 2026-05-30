@@ -12,8 +12,11 @@
 #include <XPT2046_Bitbang.h>
 #include <HTTPClient.h>
 
+// Подключаем встроенные красивые шрифты
+
 TFT_eSPI tft = TFT_eSPI();
 
+// Переменные для отслеживания изменений (чтобы экран не мерцал)
 String oldTime = "";
 float oldTemp = -100;
 float oldTarget = -100;
@@ -40,7 +43,6 @@ bool isConnected = false;
 #define TOUCH_SCLK 25
 
 #define DHT11_PIN 22
-
 #define TARGET_TEMP_ADDR 200
 
 #define WEATHER_API_KEY "5b09c7a00a36ece6308bbc11c96c50a6"
@@ -48,12 +50,11 @@ bool isConnected = false;
 
 XPT2046_Bitbang ts(TOUCH_MOSI, TOUCH_MISO, TOUCH_SCLK, TOUCH_CS);
 
-enum Screen { HOME };
-Screen currentScreen = HOME;
-
-IPAddress local_IP(192, 168, 0, 116);
-IPAddress gateway(192, 168, 0, 1);
-IPAddress subnet(255, 255, 255, 0);
+// Цветовая палитра (Modern Dark)
+#define DARK_BG      0x10A2  // Очень темный серый/синий для фона
+#define CARD_BG      0x2124  // Светло-серый фон для блоков
+#define BORDER_COLOR 0x4228  // Серый для рамок
+#define TXT_ORANGE   0xFDA0  // Оранжевый для отопления
 
 float currentTemp = 0.0;
 float targetTemp = 22.0;
@@ -82,7 +83,7 @@ String translateWeatherToCzech(String englishDesc);
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== SMART THERMOSTAT IMPROVED ===");
+  Serial.println("=== SMART THERMOSTAT UI IMPROVED ===");
   
   if (!EEPROM.begin(512)) {
     Serial.println("EEPROM Init Failed");
@@ -94,160 +95,187 @@ void setup() {
   
   tft.init();
   tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(DARK_BG);
   
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
   
-  ts.begin(); // Инициализация тачскрина
+  ts.begin();
   Serial.println("Touch screen initialized");
   
   setupWiFi();
   setupTime();
-  fetchWeather(); // Сразу запросим погоду при старте
-  
-  Serial.println("UI initialized");
+  fetchWeather();
 }
 
 void drawHomeScreen() {
   static bool firstRun = true;
+  
+  // При первом запуске рисуем статичную красивую подложку (интерфейс в виде карточек)
   if (firstRun) {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DARK_BG);
+    
+    // Карточка времени (Верхняя)
+    tft.fillRoundRect(10, 10, 300, 50, 6, CARD_BG);
+    tft.drawRoundRect(10, 10, 300, 50, 6, BORDER_COLOR);
+    
+    // Карточка температур (Основная по центру)
+    tft.fillRoundRect(10, 68, 300, 124, 6, CARD_BG);
+    tft.drawRoundRect(10, 68, 300, 124, 6, BORDER_COLOR);
+    
+    // Статичные надписи мелким красивым шрифтом
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(TFT_LIGHTGREY);
+    tft.drawString("ROOM", 25, 76);
+    tft.drawString("TARGET", 135, 76);
+    tft.drawString("HUMIDITY", 25, 134);
+    tft.drawString("STATUS", 135, 134);
+    
+    // Кнопка "+" (Справа сверху в блоке температуры)
+    tft.fillRoundRect(240, 76, 60, 48, 6, TFT_RED);
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("+", 262, 92);
+    
+    // Кнопка "-" (Справа снизу в блоке температуры)
+    tft.fillRoundRect(240, 134, 60, 48, 6, TFT_BLUE);
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("-", 264, 150);
+
+    // Нижняя плашка погоды
+    tft.fillRoundRect(10, 200, 210, 32, 6, CARD_BG);
+    tft.drawRoundRect(10, 200, 210, 32, 6, BORDER_COLOR);
+    
+    // Кнопка погоды "Refresh"
+    tft.fillRoundRect(230, 200, 80, 32, 6, 0x03E0); // Темно-зеленый
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("Update", 244, 211);
+    
     firstRun = false;
   }
 
-  // ===== CLOCK =====
+  // ===== ЧАСЫ (Крупный сглаженный шрифт) =====
   String timeStr = getCurrentTime();
   if (timeStr != oldTime) {
-    tft.fillRect(60, 10, 200, 40, TFT_BLACK);
-    tft.setTextSize(3); // Стандартный крупный шрифт (чтобы не упало без .h файлов)
+    // Стираем старое время цветом карточки
+    tft.fillRect(75, 16, 170, 38, CARD_BG);
+    tft.setFreeFont(&FreeSansBold24pt7b);
     tft.setTextColor(TFT_WHITE);
-    tft.drawString(timeStr, SCREEN_WIDTH/2 - 70, 15);
+    tft.drawString(timeStr.substring(0, 5), 105, 20); // Выводим только ЧЧ:ММ для красоты
     oldTime = timeStr;
   }
 
-  // ===== TEMPERATURE =====
+  // ===== ТЕКУЩАЯ ТЕМПЕРАТУРА РОМ =====
   if (abs(currentTemp - oldTemp) > 0.05) {
-    tft.fillRect(40, 60, 100, 30, TFT_BLACK);
-    tft.setTextSize(2);
+    tft.fillRect(25, 96, 85, 28, CARD_BG);
+    tft.setFreeFont(&FreeSansBold12pt7b);
     tft.setTextColor(TFT_CYAN);
-    tft.drawString(String(currentTemp, 1) + "C", SCREEN_WIDTH/2 - 110, 65);
+    tft.drawString(String(currentTemp, 1) + " C", 25, 96);
     oldTemp = currentTemp;
   }
 
+  // ===== ЦЕЛЕВАЯ ТЕМПЕРАТУРА =====
   if (abs(targetTemp - oldTarget) > 0.05) {
-    tft.fillRect(170, 60, 120, 30, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_LIGHTGREY);
-    tft.drawString("->" + String(targetTemp, 1) + "C", SCREEN_WIDTH/2 + 10, 65);
+    tft.fillRect(135, 96, 95, 28, CARD_BG);
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString(String(targetTemp, 1) + " C", 135, 96);
     oldTarget = targetTemp;
   }
 
-  // ===== BUTTONS =====
-  static bool buttonsDrawn = false;
-  if (!buttonsDrawn) {
-    tft.fillRect(60, 110, 80, 50, TFT_RED);
-    tft.setTextSize(3);
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("+", 92, 122);
-
-    tft.fillRect(180, 110, 80, 50, TFT_BLUE);
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("-", 212, 122);
-    
-    buttonsDrawn = true;
-  }
-
-  // ===== HUMIDITY =====
+  // ===== ВЛАЖНОСТЬ =====
   if (abs(currentHumidity - oldHumidity) > 0.5) {
-    tft.fillRect(100, 170, 120, 30, TFT_BLACK);
-    tft.setTextSize(2);
+    tft.fillRect(25, 154, 85, 28, CARD_BG);
+    tft.setFreeFont(&FreeSansBold12pt7b);
     tft.setTextColor(TFT_MAGENTA);
-    tft.drawString(String(currentHumidity, 0) + "% RH", SCREEN_WIDTH/2 - 40, 175);
+    tft.drawString(String(currentHumidity, 0) + " %", 25, 154);
     oldHumidity = currentHumidity;
   }
 
-  // ===== WIFI =====
+  // ===== СТАТУС ОТОПЛЕНИЯ =====
+  if (heatingOn != oldHeating) {
+    tft.fillRect(135, 154, 95, 28, CARD_BG);
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    if (heatingOn) {
+      tft.setTextColor(TXT_ORANGE);
+      tft.drawString("HEAT ON", 135, 154);
+    } else {
+      tft.setTextColor(TFT_GREEN);
+      tft.drawString("IDLE", 135, 154);
+    }
+    oldHeating = heatingOn;
+  }
+
+  // ===== СТАТУС WIFI (Иконка-индикатор в углу часов) =====
   if (isConnected != oldWifi) {
-    tft.fillRect(0, 0, 100, 20, TFT_BLACK);
-    tft.setTextSize(1);
-    tft.setTextColor(isConnected ? TFT_GREEN : TFT_RED);
-    tft.drawString(isConnected ? "WIFI OK" : "NO WIFI", 10, 5);
+    tft.fillCircle(290, 35, 6, isConnected ? TFT_GREEN : TFT_RED);
     oldWifi = isConnected;
   }
   
-  // ===== WEATHER =====
+  // ===== ПОГОДА =====
   if (weatherTemp != oldWeatherTemp || weatherDesc != oldWeatherDesc) {
-    tft.fillRect(10, 210, 200, 25, TFT_BLACK);
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_YELLOW);
-    tft.drawString(weatherTemp + " " + weatherDesc, 15, 215);
+    tft.fillRect(16, 206, 198, 20, CARD_BG);
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(weatherTemp + "  " + weatherDesc, 20, 211);
     oldWeatherTemp = weatherTemp;
     oldWeatherDesc = weatherDesc;
-  }
-
-  static bool weatherButtonDrawn = false;
-  if (!weatherButtonDrawn) {
-    tft.fillRect(230, 205, 80, 30, TFT_GREEN);
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_BLACK);
-    tft.drawString("Refresh", 245, 215);
-    weatherButtonDrawn = true;
   }
 }
 
 void checkTouch() {
   TouchPoint p = ts.getTouch();
   
-  // Проверяем, что координаты не нулевые (экран действительно нажат)
   if (p.x != 0 || p.y != 0) { 
-    
-    // Инвертируем карту координат под поворот экрана tft.setRotation(1)
-
+    // Применяем твою точную рабочую коррекцию координат!
     int displayX = map(p.x, 300, 30, 0, 320);
     int displayY = map(p.y, 220, 20, 0, 240);
     
-    // Проверяем, что координаты входят в рамки разрешения экрана
     if(displayX > 0 && displayX < 320 && displayY > 0 && displayY < 240) {
       Serial.printf("Touch: X=%d, Y=%d\n", displayX, displayY);
       handleHomeTouch(displayX, displayY);
-      
-      // Задержка (антидребезг), чтобы одно нажатие не засчитывалось по 100 раз
-      delay(250); 
+      delay(200); // Антидребезг
     }
   }
 }
+
 void handleHomeTouch(int x, int y) {
-  // Координаты кнопок подправлены под новые размеры отрисовки
-  if (x >= 60 && x <= 140 && y >= 110 && y <= 160) {
+  // Координаты кнопки "+" (240, 76, ширина 60, высота 48)
+  if (x >= 240 && x <= 300 && y >= 76 && y <= 124) {
     Serial.println("Plus pressed");
     targetTemp += 0.5;
     if (targetTemp > 35.0) targetTemp = 35.0;
     saveTargetTemp();
   }
 
-  if (x >= 180 && x <= 260 && y >= 110 && y <= 160) {
+  // Координаты кнопки "-" (240, 134, ширина 60, высота 48)
+  if (x >= 240 && x <= 300 && y >= 134 && y <= 182) {
     Serial.println("Minus pressed");
     targetTemp -= 0.5;
     if (targetTemp < 5.0) targetTemp = 5.0;
     saveTargetTemp();
   }
 
-  if (x >= 230 && x <= 310 && y >= 205 && y <= 235) {
-    Serial.println("Weather refresh pressed");
+  // Координаты кнопки обновления погоды "Update" (230, 200, ширина 80, высота 32)
+  if (x >= 230 && x <= 310 && y >= 200 && y <= 232) {
+    Serial.println("Weather update requested");
     fetchWeather();
   }
 }
 
 void checkHeating() {
   heatingOn = currentTemp < targetTemp;
-  // Тут можно добавить управление пином реле котла, если оно подключено
 }
 
 void setupWiFi() {
   Serial.println("=== WiFi Setup ===");
-  wm.setConfigPortalTimeout(180);
-  wm.setAPStaticIPConfig(local_IP, gateway, subnet);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString("Connecting to WiFi...", 20, 30);
+  
+  wm.setConfigPortalTimeout(120);
   
   if (wm.autoConnect("ESP32_Thermostat_AP", "12345678")) {
     Serial.println("Connected!");
@@ -266,7 +294,7 @@ void readTemperature() {
     currentTemp = temp;
     currentHumidity = humidity;
   } else {
-    Serial.println("DHT11 error!");
+    Serial.println("DHT11 read error!");
   }
 }
 
@@ -287,13 +315,12 @@ void setupTime() {
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
     timeInitialized = true;
-    Serial.println("Time sync OK");
   }
 }
 
 String getCurrentTime() {
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return "--:--:--";
+  if (!getLocalTime(&timeinfo)) return "--:--";
   char timeString[20];
   strftime(timeString, sizeof(timeString), "%H:%M:%S", &timeinfo);
   return String(timeString);
@@ -311,7 +338,6 @@ void fetchWeather() {
   if (httpCode == 200) {
     String payload = http.getString();
     
-    // Безопасное выделение памяти в куче (Heap), чтобы не уронить стек
     DynamicJsonDocument* doc = new DynamicJsonDocument(1500); 
     deserializeJson(*doc, payload);
     
@@ -321,10 +347,10 @@ void fetchWeather() {
     weatherTemp = String(temp, 1) + "C";
     weatherDesc = translateWeatherToCzech(String(description));
     
-    delete doc; // Обязательно освобождаем память!
-    Serial.println("Weather updated!");
+    delete doc;
+    Serial.println("Weather sync OK");
   } else {
-    Serial.printf("Weather error: %d\n", httpCode);
+    Serial.printf("Weather HTTP error: %d\n", httpCode);
   }
   http.end();
 }
