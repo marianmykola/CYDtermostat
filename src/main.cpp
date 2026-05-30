@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include <WiFiManager.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
@@ -12,17 +14,18 @@
 #include <XPT2046_Bitbang.h>
 #include <HTTPClient.h>
 
-// Подключаем встроенные красивые шрифты
+// Локальные красивые шрифты из папки include
 
 TFT_eSPI tft = TFT_eSPI();
 
-// Переменные для отслеживания изменений (чтобы экран не мерцал)
+// Переменные для отслеживания изменений интерфейса (против мерцания)
 String oldTime = "";
-float oldTemp = -100;
-float oldTarget = -100;
+float oldTemp = 23;
+float oldTarget = 18;
 float oldHumidity = -100;
 bool oldHeating = false;
 bool oldWifi = false;
+bool oldMqttConnected = false;
 
 String weatherTemp = "";
 String weatherDesc = "";
@@ -45,22 +48,43 @@ bool isConnected = false;
 #define DHT11_PIN 22
 #define TARGET_TEMP_ADDR 200
 
+// OpenWeather Config
 #define WEATHER_API_KEY "5b09c7a00a36ece6308bbc11c96c50a6"
 #define WEATHER_CITY "Valdice"
 
 XPT2046_Bitbang ts(TOUCH_MOSI, TOUCH_MISO, TOUCH_SCLK, TOUCH_CS);
 
 // Цветовая палитра (Modern Dark)
-#define DARK_BG      0x10A2  // Очень темный серый/синий для фона
-#define CARD_BG      0x2124  // Светло-серый фон для блоков
-#define BORDER_COLOR 0x4228  // Серый для рамок
-#define TXT_ORANGE   0xFDA0  // Оранжевый для отопления
+#define DARK_BG      0x10A2  
+#define CARD_BG      0x2124  
+#define BORDER_COLOR 0x4228  
+#define TXT_ORANGE   0xFDA0  
 
+// -------- Настройки MQTT (HiveMQ TLS) --------
+WiFiClientSecure espClient;
+PubSubClient mqttClient(espClient);
+
+const char* mqttServer = "67d990d328564142ada404280806eb3b.s1.eu.hivemq.cloud";
+const int mqttPort = 8883;
+const char* mqttUser = "esp32";
+const char* mqttPassword = "Energy654.";
+
+const char* tempTopic = "esp32/temperature";
+const char* humTopic = "esp32/humidity";
+const char* timeTopic = "esp32/time";
+const char* targetTempTopic = "esp32/targetTemp";
+const char* relayStatusTopic = "esp32/rele";
+
+unsigned long lastPublish = 0;
+const unsigned long publishInterval = 5000; // 5 секунд
+
+// Текущее состояние термостата
 float currentTemp = 0.0;
 float targetTemp = 22.0;
 float currentHumidity = 0.0;
 bool heatingOn = false;
 
+// Синхронизация времени
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
 const int daylightOffset_sec = 3600;
@@ -68,6 +92,7 @@ bool timeInitialized = false;
 
 DHT dht(DHT11_PIN, DHT11);
 
+// Прототипы функций
 void drawHomeScreen();
 void checkTouch();
 void handleHomeTouch(int x, int y);
@@ -80,10 +105,12 @@ String getCurrentTime();
 void fetchWeather();
 void checkHeating();
 String translateWeatherToCzech(String englishDesc);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+bool mqttConnect();
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== SMART THERMOSTAT UI IMPROVED ===");
+  Serial.println("=== SMART THERMOSTAT CYD + MQTT ===");
   
   if (!EEPROM.begin(512)) {
     Serial.println("EEPROM Init Failed");
@@ -101,29 +128,32 @@ void setup() {
   digitalWrite(TFT_BL, HIGH);
   
   ts.begin();
-  Serial.println("Touch screen initialized");
   
   setupWiFi();
   setupTime();
+  
+  // Конфигурация защищенного соединения TLS для HiveMQ
+  espClient.setInsecure(); // Отключаем проверку цепочки сертификатов для экономии памяти ESP32
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  
   fetchWeather();
 }
 
 void drawHomeScreen() {
   static bool firstRun = true;
   
-  // При первом запуске рисуем статичную красивую подложку (интерфейс в виде карточек)
   if (firstRun) {
     tft.fillScreen(DARK_BG);
     
-    // Карточка времени (Верхняя)
+    // Блок часов
     tft.fillRoundRect(10, 10, 300, 50, 6, CARD_BG);
     tft.drawRoundRect(10, 10, 300, 50, 6, BORDER_COLOR);
     
-    // Карточка температур (Основная по центру)
+    // Основная карточка данных
     tft.fillRoundRect(10, 68, 300, 124, 6, CARD_BG);
     tft.drawRoundRect(10, 68, 300, 124, 6, BORDER_COLOR);
     
-    // Статичные надписи мелким красивым шрифтом
     tft.setFreeFont(&FreeSans9pt7b);
     tft.setTextColor(TFT_LIGHTGREY);
     tft.drawString("ROOM", 25, 76);
@@ -131,24 +161,24 @@ void drawHomeScreen() {
     tft.drawString("HUMIDITY", 25, 134);
     tft.drawString("STATUS", 135, 134);
     
-    // Кнопка "+" (Справа сверху в блоке температуры)
-    tft.fillRoundRect(240, 76, 60, 48, 6, TFT_RED);
+    // Кнопка "+" (Размер 65x65)
+    tft.fillRoundRect(240, 72, 65, 65, 8, TFT_RED);
     tft.setFreeFont(&FreeSansBold12pt7b);
     tft.setTextColor(TFT_WHITE);
-    tft.drawString("+", 262, 92);
+    tft.drawString("+", 264, 92);
     
-    // Кнопка "-" (Справа снизу в блоке температуры)
-    tft.fillRoundRect(240, 134, 60, 48, 6, TFT_BLUE);
+    // Кнопка "-" (Размер 65x65)
+    tft.fillRoundRect(240, 142, 65, 65, 8, TFT_BLUE);
     tft.setFreeFont(&FreeSansBold12pt7b);
     tft.setTextColor(TFT_WHITE);
-    tft.drawString("-", 264, 150);
+    tft.drawString("-", 264, 162);
 
-    // Нижняя плашка погоды
+    // Нижний бар погоды
     tft.fillRoundRect(10, 200, 210, 32, 6, CARD_BG);
     tft.drawRoundRect(10, 200, 210, 32, 6, BORDER_COLOR);
     
-    // Кнопка погоды "Refresh"
-    tft.fillRoundRect(230, 200, 80, 32, 6, 0x03E0); // Темно-зеленый
+    // Кнопка Update
+    tft.fillRoundRect(230, 200, 80, 32, 6, 0x03E0); 
     tft.setFreeFont(&FreeSans9pt7b);
     tft.setTextColor(TFT_WHITE);
     tft.drawString("Update", 244, 211);
@@ -156,18 +186,17 @@ void drawHomeScreen() {
     firstRun = false;
   }
 
-  // ===== ЧАСЫ (Крупный сглаженный шрифт) =====
+  // ===== ЧАСЫ =====
   String timeStr = getCurrentTime();
   if (timeStr != oldTime) {
-    // Стираем старое время цветом карточки
     tft.fillRect(75, 16, 170, 38, CARD_BG);
     tft.setFreeFont(&FreeSansBold24pt7b);
     tft.setTextColor(TFT_WHITE);
-    tft.drawString(timeStr.substring(0, 5), 105, 20); // Выводим только ЧЧ:ММ для красоты
+    tft.drawString(timeStr.substring(0, 5), 105, 20); 
     oldTime = timeStr;
   }
 
-  // ===== ТЕКУЩАЯ ТЕМПЕРАТУРА РОМ =====
+  // ===== ТЕКУЩАЯ ТЕМПЕРАТУРА =====
   if (abs(currentTemp - oldTemp) > 0.05) {
     tft.fillRect(25, 96, 85, 28, CARD_BG);
     tft.setFreeFont(&FreeSansBold12pt7b);
@@ -208,10 +237,16 @@ void drawHomeScreen() {
     oldHeating = heatingOn;
   }
 
-  // ===== СТАТУС WIFI (Иконка-индикатор в углу часов) =====
+  // ===== ИНДИКАТОРЫ СВЯЗИ (Точки в верхнем правом углу карточки часов) =====
   if (isConnected != oldWifi) {
-    tft.fillCircle(290, 35, 6, isConnected ? TFT_GREEN : TFT_RED);
+    tft.fillCircle(275, 35, 5, isConnected ? TFT_GREEN : TFT_RED); // Левая точка - Wi-Fi
     oldWifi = isConnected;
+  }
+  
+  bool mqttOk = mqttClient.connected();
+  if (mqttOk != oldMqttConnected) {
+    tft.fillCircle(292, 35, 5, mqttOk ? TFT_BLUE : TFT_DARKGREY); // Правая точка - MQTT (Синяя/Серая)
+    oldMqttConnected = mqttOk;
   }
   
   // ===== ПОГОДА =====
@@ -227,40 +262,39 @@ void drawHomeScreen() {
 
 void checkTouch() {
   TouchPoint p = ts.getTouch();
-  
   if (p.x != 0 || p.y != 0) { 
-    // Применяем твою точную рабочую коррекцию координат!
     int displayX = map(p.x, 300, 30, 0, 320);
     int displayY = map(p.y, 220, 20, 0, 240);
     
     if(displayX > 0 && displayX < 320 && displayY > 0 && displayY < 240) {
       Serial.printf("Touch: X=%d, Y=%d\n", displayX, displayY);
       handleHomeTouch(displayX, displayY);
-      delay(200); // Антидребезг
+      delay(200); 
     }
   }
 }
 
 void handleHomeTouch(int x, int y) {
-  // Координаты кнопки "+" (240, 76, ширина 60, высота 48)
-  if (x >= 240 && x <= 300 && y >= 76 && y <= 124) {
-    Serial.println("Plus pressed");
+  if (x >= 240 && x <= 305 && y >= 72 && y <= 137) {
     targetTemp += 0.5;
     if (targetTemp > 35.0) targetTemp = 35.0;
     saveTargetTemp();
+    // Сразу отправляем изменение в MQTT брокер при нажатии кнопки на экране
+    if (mqttClient.connected()) {
+      mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+    }
   }
 
-  // Координаты кнопки "-" (240, 134, ширина 60, высота 48)
-  if (x >= 240 && x <= 300 && y >= 134 && y <= 182) {
-    Serial.println("Minus pressed");
+  if (x >= 240 && x <= 305 && y >= 142 && y <= 207) {
     targetTemp -= 0.5;
     if (targetTemp < 5.0) targetTemp = 5.0;
     saveTargetTemp();
+    if (mqttClient.connected()) {
+      mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+    }
   }
 
-  // Координаты кнопки обновления погоды "Update" (230, 200, ширина 80, высота 32)
   if (x >= 230 && x <= 310 && y >= 200 && y <= 232) {
-    Serial.println("Weather update requested");
     fetchWeather();
   }
 }
@@ -277,11 +311,19 @@ void setupWiFi() {
   
   wm.setConfigPortalTimeout(120);
   
+  IPAddress local_IP(192, 168, 0, 115);
+  IPAddress gateway(192, 168, 0, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress dns(8, 8, 8, 8);
+  
+  wm.setSTAStaticIPConfig(local_IP, gateway, subnet, dns);
+  wm.setAPStaticIPConfig(local_IP, gateway, subnet);
+  
   if (wm.autoConnect("ESP32_Thermostat_AP", "12345678")) {
-    Serial.println("Connected!");
+    Serial.println("WiFi Connected!");
     isConnected = true;
   } else {
-    Serial.println("Portal timeout, restarting...");
+    Serial.println("Timeout, restarting...");
     delay(1000);
     ESP.restart();
   }
@@ -293,8 +335,6 @@ void readTemperature() {
   if (!isnan(temp) && !isnan(humidity)) {
     currentTemp = temp;
     currentHumidity = humidity;
-  } else {
-    Serial.println("DHT11 read error!");
   }
 }
 
@@ -328,29 +368,19 @@ String getCurrentTime() {
 
 void fetchWeather() {
   if (!isConnected) return;
-
   HTTPClient http;
   String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(WEATHER_CITY) + "&appid=" + String(WEATHER_API_KEY) + "&units=metric&lang=cs";
-  
   http.begin(url);
   int httpCode = http.GET();
-  
   if (httpCode == 200) {
     String payload = http.getString();
-    
     DynamicJsonDocument* doc = new DynamicJsonDocument(1500); 
     deserializeJson(*doc, payload);
-    
     float temp = (*doc)["main"]["temp"];
     const char* description = (*doc)["weather"][0]["description"];
-    
     weatherTemp = String(temp, 1) + "C";
     weatherDesc = translateWeatherToCzech(String(description));
-    
     delete doc;
-    Serial.println("Weather sync OK");
-  } else {
-    Serial.printf("Weather HTTP error: %d\n", httpCode);
   }
   http.end();
 }
@@ -368,10 +398,60 @@ String translateWeatherToCzech(String englishDesc) {
   return englishDesc;
 }
 
+// -------- РАБОТА С MQTT (HiveMQ) --------
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, targetTempTopic) == 0) {
+    char buf[length + 1];
+    memcpy(buf, payload, length);
+    buf[length] = '\0';
+    float val = atof(buf);
+    if (!isnan(val) && val >= 5.0 && val <= 35.0) {
+      targetTemp = val;
+      saveTargetTemp();
+      Serial.printf("New TargetTemp from MQTT: %.1f\n", targetTemp);
+    }
+  }
+}
+
+bool mqttConnect() {
+  if (mqttClient.connected()) return true;
+  
+  Serial.print("Attempting MQTT connection to HiveMQ...");
+  String clientId = "ESP32-CYD-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  
+  if (mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword)) {
+    Serial.println("Connected to Broker!");
+    mqttClient.subscribe(targetTempTopic);
+    return true;
+  } {
+    Serial.print("failed, rc=");
+    Serial.println(mqttClient.state());
+    return false;
+  }
+}
+
 void loop() {
+  // Обработка тачскрина и обновление интерфейса
   checkTouch();
   drawHomeScreen();
   
+  // Поддержание MQTT сессии и обработка входящих подписок
+  if (isConnected) {
+    if (!mqttClient.connected()) {
+      static unsigned long lastReconnectAttempt = 0;
+      if (millis() - lastReconnectAttempt > 10000) { // Пробуем подключиться каждые 10 секунд не блокируя loop
+        lastReconnectAttempt = millis();
+        if (mqttConnect()) {
+          lastReconnectAttempt = 0;
+        }
+      }
+    } else {
+      mqttClient.loop();
+    }
+  }
+
+  // Чтение датчика температуры и проверка нагрева (каждые 5 секунд)
   static unsigned long lastTempRead = 0;
   if (millis() - lastTempRead > 5000) {
     readTemperature();
@@ -379,6 +459,21 @@ void loop() {
     lastTempRead = millis();
   }
   
+  // Отправка телеметрии в MQTT (каждые 5 секунд)
+  unsigned long now = millis();
+  if (now - lastPublish >= publishInterval) {
+    lastPublish = now;
+    if (mqttClient.connected()) {
+      mqttClient.publish(tempTopic, String(currentTemp, 1).c_str(), true);
+      mqttClient.publish(humTopic, String(currentHumidity, 0).c_str(), true);
+      mqttClient.publish(relayStatusTopic, heatingOn ? "ON" : "OFF", true);
+      mqttClient.publish(timeTopic, getCurrentTime().c_str(), true);
+      mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+      Serial.println("MQTT Publish OK");
+    }
+  }
+  
+  // Обновление погоды с OpenWeather (раз в 10 минут)
   static unsigned long lastWeatherFetch = 0;
   if (millis() - lastWeatherFetch > 600000) {
     fetchWeather();
