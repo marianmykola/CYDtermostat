@@ -8,7 +8,7 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
-#include <DHT.h>
+#include <DallasTemperature.h>
 #include <time.h>
 #include <vector>
 #include <String>
@@ -53,8 +53,10 @@ bool isConnected = false;
 #define TOUCH_MOSI 32
 #define TOUCH_MISO 39
 #define TOUCH_SCLK 25
+#define ONE_WIRE_BUS 22
 
-#define DHT11_PIN 22
+OneWire oneWire(ONE_WIRE_BUS);  
+DallasTemperature sensors(&oneWire);
 
 // EEPROM Память
 #define TARGET_TEMP_ADDR 200
@@ -113,7 +115,6 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
 const int daylightOffset_sec = 3600;
 
-DHT dht(DHT11_PIN, DHT11);
 
 // Прототипы функций
 void drawHomeScreen();
@@ -227,7 +228,7 @@ void setup() {
   loadTargetTemp();
   loadBrightness();
   
-  dht.begin();
+  sensors.begin();
   readTemperature();
   
   pinMode(RELAY_PIN, OUTPUT);
@@ -504,14 +505,12 @@ void setupWiFi() {
 }
 
 void readTemperature() {
-  float temp = dht.readTemperature();
-  float humidity = dht.readHumidity();
-  if (!isnan(temp) && !isnan(humidity)) {
+  sensors.requestTemperatures();
+  float temp = sensors.getTempCByIndex(0);
+  if (!isnan(temp)) {
     currentTemp = temp;
-    currentHumidity = humidity;
   }
 }
-
 void saveTargetTemp() {
   EEPROM.put(TARGET_TEMP_ADDR, targetTemp);
   EEPROM.commit();
