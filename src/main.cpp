@@ -30,7 +30,6 @@ String oldTime = "";
 String oldDate = "";
 float oldTemp = -100;
 float oldTarget = -100;
-float oldHumidity = -100;
 bool oldHeating = false;
 bool oldWifi = false;
 bool oldMqttConnected = false;
@@ -91,7 +90,6 @@ const char* mqttUser = "esp32";
 const char* mqttPassword = "Energy654.";
 
 const char* tempTopic = "esp32/temperature";
-const char* humTopic = "esp32/humidity";
 const char* timeTopic = "esp32/time";
 const char* targetTempTopic = "esp32/targetTemp";
 const char* relayStatusTopic = "esp32/rele";
@@ -106,7 +104,6 @@ const unsigned long publishInterval = 5000;
 
 float currentTemp = 0.0;
 float targetTemp = 22.0;
-float currentHumidity = 0.0;
 bool heatingOn = false;
 int displayBrightness = 255; 
 
@@ -181,7 +178,6 @@ const char* webPage = R"rawliteral(
     </div>
 
     <div class="info-grid">
-      <div>Vlhkost:</div><div class="status-val" id="hum">-- %</div>
       <div>Stav topení:</div><div class="status-val" id="relay">--</div>
       <div>Wi-Fi IP:</div><div class="status-val">192.168.0.115</div>
       <div>MQTT Broker:</div><div class="status-val" id="mqtt">--</div>
@@ -195,7 +191,6 @@ async function fetchStatus(){
     const j = await res.json();
     document.getElementById('temp').innerText = j.temp.toFixed(1) + ' °C';
     document.getElementById('target').innerText = j.target.toFixed(1);
-    document.getElementById('hum').innerText = j.humidity + ' %';
     document.getElementById('time').innerText = j.time;
     document.getElementById('relay').innerText = j.heating ? 'TOPENÍ ZAP' : 'NEAKTIVNÍ';
     document.getElementById('mqtt').innerText = j.mqtt ? 'CONNECTED' : 'DISCONNECTED';
@@ -232,7 +227,7 @@ void setup() {
   readTemperature();
   
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(RELAY_PIN, HIGH);
 
   tft.init();
   tft.setRotation(1);
@@ -267,7 +262,6 @@ void setupWebServer() {
     String t = getCurrentTime();
     String payload = "{\"temp\":" + String(currentTemp, 1) + 
                      ",\"target\":" + String(targetTemp, 1) +
-                     ",\"humidity\":" + String(currentHumidity, 0) +
                      ",\"time\":\"" + t + "\"" +
                      ",\"brightness\":" + String(displayBrightness) +
                      ",\"heating\":" + (heatingOn ? "true" : "false") +
@@ -289,7 +283,7 @@ void setupWebServer() {
     saveTargetTemp();
     if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
     server.send(200, "text/plain", "ok");
-  });
+  });  
   
   server.on("/set_brightness", HTTP_POST, []() {
     if (server.hasArg("value")) {
@@ -341,7 +335,6 @@ void drawHomeScreen() {
     tft.setTextColor(TFT_LIGHTGREY);
     tft.drawString("MISTNOST", 20, 80);
     tft.drawString("CIL", 160, 80);
-    tft.drawString("VLHKOST", 20, 140);
     tft.drawString("STAV", 140, 140);
     
     // Сенсорные кнопки Кнопки "+" и "-"
@@ -349,16 +342,19 @@ void drawHomeScreen() {
     tft.fillRoundRect(240, 137, 60, 55, 8, TFT_BLUE);
     
     // Отрисовка символов на кнопках (Ubuntu_Bold12pt7b отлично подойдет)
+    tft.setFreeFont(&Ubuntu_Bold12pt7b);
     tft.setTextColor(TFT_WHITE);
-    tft.drawString("+", 264, 95);
-    tft.drawString("-", 266, 160);
-
+    tft.drawString("+", 264, 92);
+    tft.drawString("-", 266, 155);
+    tft.setFreeFont(&Ubuntu_Bold9pt7b);
     // Рамка погоды внизу
     tft.fillRoundRect(10, 200, 210, 32, 6, CARD_BG);
     tft.drawRoundRect(10, 200, 210, 32, 6, BORDER_COLOR);
     tft.fillRoundRect(230, 200, 80, 32, 6, 0x03E0); 
-    
+    tft.setFreeFont(&Ubuntu_Bold9pt7b);
     tft.drawString("Update", 235, 210);
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString("OFF", 140, 165);
     
     firstRun = false;
   }
@@ -391,16 +387,6 @@ void drawHomeScreen() {
     tft.drawString(String(targetTemp, 1) + " °C", 140, 105);
     oldTarget = targetTemp;
   }
-
-  // --- Влажность (Ubuntu Regular 12pt) ---
-  if (abs(currentHumidity - oldHumidity) > 0.5) {
-    tft.fillRect(20, 160, 85, 22, CARD_BG);
-    tft.setFreeFont(&Ubuntu_Regular12pt7b);
-    tft.setTextColor(TFT_MAGENTA);
-    tft.drawString(String(currentHumidity, 0) + " %", 35, 165);
-    oldHumidity = currentHumidity;
-  }
-
   // --- Статус реле отопления (Ubuntu Regular 12pt) ---
   if (heatingOn != oldHeating) {
     tft.fillRect(140, 160, 95, 22, CARD_BG);
@@ -473,14 +459,14 @@ void checkHeating() {
   // Включение отопления
   if (!heatingOn && currentTemp <= targetTemp - hysteresisLow) {
     heatingOn = true;
-    digitalWrite(RELAY_PIN, HIGH); // или LOW если реле инверсное
+    digitalWrite(RELAY_PIN, LOW); // или LOW если реле инверсное
     Serial.println("Heating ON");
   }
 
   // Выключение отопления
   if (heatingOn && currentTemp >= targetTemp + hysteresisHigh) {
     heatingOn = false;
-    digitalWrite(RELAY_PIN, LOW); // или HIGH если реле инверсное
+    digitalWrite(RELAY_PIN, HIGH); // или HIGH если реле инверсное
     Serial.println("Heating OFF");
   }
 }
@@ -606,7 +592,6 @@ void loop() {
     lastPublish = now;
     if (mqttClient.connected()) {
       mqttClient.publish(tempTopic, String(currentTemp, 1).c_str(), true);
-      mqttClient.publish(humTopic, String(currentHumidity, 0).c_str(), true);
       mqttClient.publish(relayStatusTopic, heatingOn ? "ON" : "OFF", true);
       mqttClient.publish(timeTopic, getCurrentTime().c_str(), true);
       mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
