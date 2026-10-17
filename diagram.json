@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "author": "CYD Thermostat",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-esp32-devkit-v1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-ds18b20",
+      "id": "sensor",
+      "top": -70,
+      "left": 220,
+      "attrs": {
+        "temperature": "22"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "pullup",
+      "top": 15,
+      "left": 225,
+      "rotate": 90,
+      "attrs": {
+        "value": "4700"
+      }
+    },
+    {
+      "type": "wokwi-relay-module",
+      "id": "relay",
+      "top": 120,
+      "left": 220,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [ "esp:3V3", "sensor:VCC", "red", [] ],
+    [ "esp:GND.1", "sensor:GND", "black", [] ],
+    [ "esp:D22", "sensor:DQ", "green", [] ],
+    [ "esp:3V3", "pullup:1", "red", [] ],
+    [ "pullup:2", "sensor:DQ", "green", [] ],
+    [ "esp:D27", "relay:IN", "blue", [] ],
+    [ "esp:3V3", "relay:VCC", "red", [] ],
+    [ "esp:GND.2", "relay:GND", "black", [] ]
+  ],
+  "dependencies": {}
+}
