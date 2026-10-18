@@ -85,12 +85,12 @@ XPT2046_Bitbang ts(TOUCH_MOSI, TOUCH_MISO, TOUCH_SCLK, TOUCH_CS);
 #define RELAY_PIN 27
 
 // HiveMQ TLS MQTT
-WiFiClientSecure espClient;
+WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
 // Настраиваемые MQTT параметры
-char mqttServer[64] = "67d990d328564142ada404280806eb3b.s1.eu.hivemq.cloud";
-int mqttPort = 8883;
+char mqttServer[64] = "192.168.0.111";
+int mqttPort = 1883;
 char mqttUser[32] = "esp32";
 char mqttPassword[32] = "Energy654.";
 
@@ -274,7 +274,7 @@ void setup() {
   setupTime();
   setupWebServer(); 
   
-  espClient.setInsecure(); 
+   
   mqttClient.setServer(mqttServer, mqttPort);
   mqttClient.setCallback(mqttCallback);
   
@@ -749,4 +749,5 @@ void loop() {
   }
   
   delay(10);
+  
 }
