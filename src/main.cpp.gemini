@@ -1,0 +1,616 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <WiFiManager.h>
+#include <WebServer.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <EEPROM.h>
+#include <DallasTemperature.h>
+#include <time.h>
+#include <vector>
+#include <String>
+#include <TFT_eSPI.h>
+#include <XPT2046_Bitbang.h>
+#include <HTTPClient.h>
+
+// Подключаем шрифты Ubuntu
+#include "Ubuntu_Bold7pt7b.h"
+#include "Ubuntu_Bold9pt7b.h"
+#include "Ubuntu_Bold12pt7b.h"
+#include "Ubuntu_Bold24pt7b.h"
+#include "Ubuntu_Regular12pt7b.h"
+
+TFT_eSPI tft = TFT_eSPI();
+
+// Текущий экран: 0 - Главный, 1 - Настройки
+int currentScreen = 0;
+bool redrawScreen = true;
+
+// Переменные интерфейса
+String oldTime = "";
+float oldTemp = -100;
+float oldTarget = -100;
+bool oldHeating = false;
+bool oldWifi = false;
+bool oldMqttConnected = false;
+
+String weatherTemp = "";
+String weatherDesc = "";
+String oldWeatherTemp = "";
+String oldWeatherDesc = "";
+
+WiFiManager wm;
+WebServer server(80);
+bool isConnected = false;
+
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 240
+
+// CYD Тач-пины
+#define TOUCH_CS 33
+#define TOUCH_IRQ 36
+#define TOUCH_MOSI 32
+#define TOUCH_MISO 39
+#define TOUCH_SCLK 25
+#define ONE_WIRE_BUS 22
+
+OneWire oneWire(ONE_WIRE_BUS);  
+DallasTemperature sensors(&oneWire);
+
+// EEPROM Адреса
+#define TARGET_TEMP_ADDR 200
+#define BRIGHTNESS_ADDR  210
+#define MQTT_CONFIG_ADDR 220 
+
+// ШИМ подсветки
+#define LEDC_CHANNEL 0
+#define LEDC_RESOLUTION 8
+#define LEDC_FREQ 5000
+
+// OpenWeather
+#define WEATHER_API_KEY "5b09c7a00a36ece6308bbc11c96c50a6"
+#define WEATHER_CITY "Valdice"
+
+XPT2046_Bitbang ts(TOUCH_MOSI, TOUCH_MISO, TOUCH_SCLK, TOUCH_CS);
+
+// Палитра (Modern Dark)
+#define DARK_BG      0x0841  
+#define CARD_BG      0x18E3  
+#define BORDER_COLOR 0x31A6  
+#define TXT_ORANGE   0xFDA0  
+
+#define RELAY_PIN 27
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+char mqttServer[64] = "192.168.0.111";
+int mqttPort = 1883;
+char mqttUser[32] = "esp32";
+char mqttPassword[32] = "Energy654.";
+
+const char* tempTopic = "esp32/temperature";
+const char* targetTempTopic = "esp32/targetTemp";
+const char* relayStatusTopic = "esp32/rele";
+
+float hysteresisLow = 0.2;
+float hysteresisHigh = 0.3;
+
+unsigned long lastPublish = 0;
+const unsigned long publishInterval = 5000; 
+
+float currentTemp = 0.0;
+float targetTemp = 22.0;
+bool heatingOn = false;
+int displayBrightness = 255; 
+
+// NTP
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 3600;
+const int daylightOffset_sec = 0;
+
+// Прототипы
+void drawHomeScreen();
+void drawSettingsScreen();
+void checkTouch();
+void handleHomeTouch(int x, int y);
+void handleSettingsTouch(int x, int y);
+void setupWiFi();
+void readTemperature();
+void saveTargetTemp();
+void loadTargetTemp();
+void saveBrightness();
+void loadBrightness();
+void saveMqttConfig();
+void loadMqttConfig();
+void setDisplayBrightness(int value);
+void setupTime();
+String getCurrentTime();
+void fetchWeather();
+String removeDiacritics(String str);
+void checkHeating();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+bool mqttConnect();
+void setupWebServer();
+
+// Веб-интерфейс со слайдером яркости
+const char* webPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1" charset="UTF-8">
+<title>CYD Smart Termostat</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--accent:#238636;--text:#e6eef8;--border:#30363d}
+  body{margin:0;font-family:-apple-system,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;align-items:center;padding:20px}
+  .card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,0.5);margin-bottom:15px}
+  .title{font-size:22px;font-weight:600;text-align:center;margin-bottom:20px;color:#58a6ff}
+  .bigtemp{font-size:56px;font-weight:700;text-align:center;margin:10px 0;color:#58a6ff}
+  .target{font-size:22px;text-align:center;color:#c9d1d9;margin-bottom:20px}
+  .row{display:flex;justify-content:center;gap:15px;margin-top:10px}
+  .btn{flex:1;background:var(--accent);border:none;color:white;padding:14px;border-radius:10px;font-size:18px;font-weight:600;cursor:pointer}
+  .btn.blue{background:#1f6feb}
+  .slider-container{margin:20px 0 10px 0}
+  .slider-label{display:flex;justify-content:space-between;font-size:14px;color:#8b949e;margin-bottom:8px}
+  input[type=range]{width:100%;height:6px;background:#30363d;border-radius:5px;outline:none;-webkit-appearance:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;background:#58a6ff;border-radius:50%;cursor:pointer}
+  input[type=text], input[type=password], input[type=number]{width:100%;padding:10px;background:#0d1117;border:1px solid var(--border);color:white;border-radius:8px;box-sizing:border-box;margin-top:5px;margin-bottom:12px}
+  label{font-size:13px;color:#8b949e}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="title" id="time">--:--:--</div>
+    <div class="bigtemp" id="temp">--.- °C</div>
+    <div class="target">Cíl: <span id="target">--.-</span> °C</div>
+    <div class="row">
+      <button class="btn blue" onclick="changeTemp('inc')">+0.5°C</button>
+      <button class="btn" onclick="changeTemp('dec')">-0.5°C</button>
+    </div>
+    <div class="slider-container">
+      <div class="slider-label">
+        <span>Jas displeje</span>
+        <span id="bright-val">100%</span>
+      </div>
+      <input type="range" id="brightness" min="10" max="255" value="255" onchange="updateBrightness(this.value)">
+    </div>
+  </div>
+<script>
+async function fetchStatus(){
+  try{
+    const res = await fetch('/status');
+    const j = await res.json();
+    document.getElementById('temp').innerText = j.temp.toFixed(1) + ' °C';
+    document.getElementById('target').innerText = j.target.toFixed(1);
+    document.getElementById('time').innerText = j.time;
+    document.getElementById('brightness').value = j.brightness;
+    document.getElementById('bright-val').innerText = Math.round((j.brightness/255)*100) + '%';
+  }catch(e){}
+}
+async function changeTemp(action){
+  await fetch('/' + action, {method:'POST'});
+  fetchStatus();
+}
+async function updateBrightness(val){
+  await fetch('/set_brightness?value=' + val, {method:'POST'});
+  document.getElementById('bright-val').innerText = Math.round((val/255)*100) + '%';
+}
+setInterval(fetchStatus, 2000);
+window.onload = fetchStatus;
+</script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+  
+  if (!EEPROM.begin(512)) Serial.println("EEPROM Failed");
+  loadTargetTemp();
+  loadBrightness();
+  loadMqttConfig();
+  
+  sensors.begin();
+  readTemperature();
+  
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  tft.init();
+  tft.setRotation(1);
+  tft.setAttribute(UTF8_SWITCH, true); 
+  tft.fillScreen(DARK_BG);
+  
+  ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
+  ledcAttachPin(TFT_BL, LEDC_CHANNEL);
+  setDisplayBrightness(displayBrightness); 
+  
+  ts.begin();
+  setupWiFi();
+  setupTime();
+  setupWebServer(); 
+   
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  
+  fetchWeather();
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() { server.send(200, "text/html", webPage); });
+  server.on("/status", HTTP_GET, []() {
+    String t = getCurrentTime();
+    String payload = "{\"temp\":" + String(currentTemp, 1) + 
+                     ",\"target\":" + String(targetTemp, 1) + 
+                     ",\"time\":\"" + t + "\"" +
+                     ",\"brightness\":" + String(displayBrightness) + "}";
+    server.send(200, "application/json", payload);
+  });
+  server.on("/inc", HTTP_POST, []() {
+    targetTemp = min(35.0, targetTemp + 0.5);
+    saveTargetTemp();
+    if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/dec", HTTP_POST, []() {
+    targetTemp = max(5.0, targetTemp - 0.5);
+    saveTargetTemp();
+    if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+    server.send(200, "text/plain", "ok");
+  });  
+  server.on("/set_brightness", HTTP_POST, []() {
+    if (server.hasArg("value")) {
+      int val = server.arg("value").toInt();
+      if (val >= 10 && val <= 255) {
+        displayBrightness = val;
+        setDisplayBrightness(displayBrightness);
+        saveBrightness();
+      }
+    }
+    server.send(200, "text/plain", "ok");
+  });
+  server.begin();
+}
+
+void setDisplayBrightness(int value) { ledcWrite(LEDC_CHANNEL, value); }
+void saveBrightness() { EEPROM.put(BRIGHTNESS_ADDR, displayBrightness); EEPROM.commit(); }
+void loadBrightness() { EEPROM.get(BRIGHTNESS_ADDR, displayBrightness); if (displayBrightness < 10 || displayBrightness > 255) displayBrightness = 255; }
+void saveMqttConfig() { EEPROM.put(MQTT_CONFIG_ADDR, mqttServer); EEPROM.commit(); }
+void loadMqttConfig() { EEPROM.get(MQTT_CONFIG_ADDR, mqttServer); }
+
+void drawHomeScreen() {
+  if (redrawScreen) {
+    tft.fillScreen(DARK_BG);
+    
+    // Блок часов сверху
+    tft.fillRoundRect(10, 8, 225, 54, 10, CARD_BG);
+    tft.drawRoundRect(10, 8, 225, 54, 10, BORDER_COLOR);
+
+    // Кнопка настроек "SET"
+    tft.fillRoundRect(245, 8, 65, 54, 8, 0x3186); 
+    tft.drawRoundRect(245, 8, 65, 54, 8, BORDER_COLOR);
+    tft.setFreeFont(&Ubuntu_Bold12pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("SET", 255, 26);
+
+    // Блоки температур
+    tft.fillRoundRect(10, 68, 105, 58, 8, CARD_BG);
+    tft.drawRoundRect(10, 68, 105, 58, 8, BORDER_COLOR);
+    tft.setFreeFont(&Ubuntu_Bold7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY);
+    tft.drawString("DOMA", 18, 76);
+
+    tft.fillRoundRect(122, 68, 113, 58, 8, CARD_BG);
+    tft.drawRoundRect(122, 68, 113, 58, 8, BORDER_COLOR);
+    tft.setFreeFont(&Ubuntu_Bold7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY);
+    tft.drawString("CIL", 130, 76);
+
+    // Статус отопления
+    tft.fillRoundRect(10, 133, 225, 30, 8, CARD_BG);
+    tft.drawRoundRect(10, 133, 225, 30, 8, BORDER_COLOR);
+
+    // --- КНОПКИ + И - (НЕ ТРОНУТЫ) ---
+    tft.fillRoundRect(245, 68, 65, 58, 8, 0xF800); 
+    tft.drawRoundRect(245, 68, 65, 58, 8, BORDER_COLOR);
+    
+    tft.fillRoundRect(245, 133, 65, 58, 8, 0x001F); 
+    tft.drawRoundRect(245, 133, 65, 58, 8, BORDER_COLOR);
+    
+    tft.setFreeFont(&Ubuntu_Bold24pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("+", 267, 78);
+    tft.drawString("-", 271, 143);
+    
+    // Блок погоды внизу (укорочен)
+    tft.fillRoundRect(10, 172, 225, 35, 8, CARD_BG);
+    tft.drawRoundRect(10, 172, 225, 35, 8, BORDER_COLOR);
+    
+    redrawScreen = false;
+  }
+
+  // --- Динамическое время + Строго центрированные точки ---
+  String timeStr = getCurrentTime();
+  if (timeStr != oldTime) {
+    tft.fillRect(18, 16, 170, 38, CARD_BG); 
+    tft.setFreeFont(&Ubuntu_Bold24pt7b);
+    tft.setTextColor(TFT_WHITE); 
+    tft.drawString(timeStr.substring(0, 5), 35, 15);
+    oldTime = timeStr;
+  }
+
+  // Мигание точек двоеточия (смещено левее, точно между цифрами часов и минут)
+  static unsigned long lastBlink = 0;
+  static bool colonVisible = true;
+  if (millis() - lastBlink > 1500) {
+    lastBlink = millis();
+    colonVisible = !colonVisible;
+    tft.setFreeFont(&Ubuntu_Bold24pt7b);
+    tft.setTextColor(colonVisible ? TFT_WHITE : CARD_BG);
+    tft.drawString(":", 80, 15);  // Скорректировано с 95 на 88, чтобы встать перед нулем
+  }
+
+  // --- Комнатная температура ---
+  if (abs(currentTemp - oldTemp) > 0.05) {
+    tft.fillRect(16, 95, 93, 26, CARD_BG);
+    tft.setFreeFont(&Ubuntu_Bold12pt7b);
+    tft.setTextColor(0x07FF); 
+    tft.drawString(String(currentTemp, 1) + " C", 18, 97);
+    oldTemp = currentTemp;
+  }
+
+  // --- Целевая температура ---
+  if (abs(targetTemp - oldTarget) > 0.05) {
+    tft.fillRect(128, 95, 100, 26, CARD_BG);
+    tft.setFreeFont(&Ubuntu_Bold12pt7b);
+    tft.setTextColor(0xFFE0); 
+    tft.drawString(String(targetTemp, 1) + " C", 130, 97);
+    oldTarget = targetTemp;
+  }
+  
+  // --- Статус отопления ---
+  if (heatingOn != oldHeating) {
+    tft.fillRect(18, 138, 208, 20, CARD_BG);
+    tft.setFreeFont(&Ubuntu_Bold9pt7b);
+    if (heatingOn) {
+      tft.setTextColor(TXT_ORANGE);
+      tft.drawString("TOPENI: ZAPNUTO", 18, 141);
+    } else {
+      tft.setTextColor(0x03E0); 
+      tft.drawString("TOPENI: VYPNUTO", 18, 141);
+    }
+    oldHeating = heatingOn;
+  }
+
+  // Индикаторы Wi-Fi (зеленая точка) и MQTT (вокруг синее кольцо-аура) — смещены вправо от часов, под кнопку SET не заезжают
+  if (isConnected != oldWifi) {
+    tft.fillCircle(210, 28, 5, isConnected ? 0x03E0 : 0xF800); 
+    oldWifi = isConnected;
+  }
+  bool mqttOk = mqttClient.connected();
+  if (mqttOk != oldMqttConnected) {
+    tft.drawCircle(210, 28, 9, mqttOk ? 0x001F : 0x7BEF);
+    tft.drawCircle(210, 28, 10, mqttOk ? 0x001F : 0x7BEF);
+    oldMqttConnected = mqttOk;
+  }
+  
+  // --- Погода ---
+  if (weatherTemp != oldWeatherTemp || weatherDesc != oldWeatherDesc) {
+    tft.fillRect(15, 178, 215, 24, CARD_BG);
+    tft.setFreeFont(&Ubuntu_Bold7pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(weatherTemp + "  " + weatherDesc, 18, 184); 
+    oldWeatherTemp = weatherTemp;
+    oldWeatherDesc = weatherDesc;
+  }
+}
+
+void drawSettingsScreen() {
+  if (redrawScreen) {
+    tft.fillScreen(DARK_BG);
+    tft.fillRoundRect(10, 10, 50, 45, 6, 0x8400); 
+    tft.drawRoundRect(10, 10, 50, 45, 6, BORDER_COLOR);
+    tft.setFreeFont(&Ubuntu_Bold12pt7b);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("<-", 22, 22);
+    tft.drawString("NASTAVENI", 80, 22);
+
+    tft.fillRoundRect(10, 65, 300, 75, 6, CARD_BG);
+    tft.drawRoundRect(10, 65, 300, 75, 6, BORDER_COLOR);
+    tft.setFreeFont(&Ubuntu_Bold9pt7b);
+    tft.setTextColor(TFT_LIGHTGREY);
+    tft.drawString("Jas displeje", 20, 75);
+    
+    tft.fillRoundRect(20, 100, 60, 32, 6, TFT_RED);
+    tft.fillRoundRect(240, 100, 60, 32, 6, TFT_BLUE);
+    tft.drawString("-", 47, 105);
+    tft.drawString("+", 267, 105);
+    redrawScreen = false;
+  }
+}
+
+void checkTouch() {
+  TouchPoint p = ts.getTouch();
+  if (p.x != 0 || p.y != 0) { 
+    int displayX = map(p.x, 300, 30, 0, 320);
+    int displayY = map(p.y, 220, 20, 0, 240);
+    if(displayX > 0 && displayX < 320 && displayY > 0 && displayY < 240) {
+      if (currentScreen == 0) handleHomeTouch(displayX, displayY);
+      else handleSettingsTouch(displayX, displayY);
+      delay(200); 
+    }
+  }
+}
+
+void handleHomeTouch(int x, int y) {
+  // Кнопка SET
+  if (x >= 245 && x <= 310 && y >= 8 && y <= 62) {
+    currentScreen = 1;
+    redrawScreen = true;
+    return;
+  }
+  // Кнопка Плюс (+) - НЕ ТРОНУТА
+  if (x >= 245 && x <= 310 && y >= 68 && y <= 126) {
+    targetTemp = min(35.0, targetTemp + 0.5);
+    saveTargetTemp();
+    if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+  }
+  // Кнопка Минус (-) - НЕ ТРОНУТА
+  if (x >= 245 && x <= 310 && y >= 133 && y <= 191) {
+    targetTemp = max(5.0, targetTemp - 0.5);
+    saveTargetTemp();
+    if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+  }
+}
+
+void handleSettingsTouch(int x, int y) {
+  if (x >= 10 && x <= 60 && y >= 10 && y <= 55) {
+    currentScreen = 0;
+    redrawScreen = true; 
+    oldTime = "";        
+    oldTemp = -100;
+    oldTarget = -100;
+    oldHeating = !heatingOn;
+    oldWeatherTemp = "";
+    return;
+  }
+  if (x >= 20 && x <= 80 && y >= 100 && y <= 132) {
+    displayBrightness = max(20, displayBrightness - 25);
+    setDisplayBrightness(displayBrightness);
+    saveBrightness();
+  }
+  if (x >= 240 && x <= 300 && y >= 100 && y <= 132) {
+    displayBrightness = min(255, displayBrightness + 25);
+    setDisplayBrightness(displayBrightness);
+    saveBrightness();
+  }
+}
+
+void checkHeating() {
+  if (!heatingOn && currentTemp <= targetTemp - hysteresisLow) {
+    heatingOn = true;
+    digitalWrite(RELAY_PIN, LOW);
+  }
+  if (heatingOn && currentTemp >= targetTemp + hysteresisHigh) {
+    heatingOn = false;
+    digitalWrite(RELAY_PIN, HIGH);
+  }
+}
+
+void setupWiFi() {
+  wm.setConfigPortalTimeout(120);
+  IPAddress local_IP(192, 168, 0, 115);
+  IPAddress gateway(192, 168, 0, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress dns(8, 8, 8, 8);
+  wm.setSTAStaticIPConfig(local_IP, gateway, subnet, dns);
+  if (wm.autoConnect("ESP32_Thermostat_AP", "12345678")) isConnected = true;
+  else { delay(1000); ESP.restart(); }
+}
+
+void readTemperature() {
+  sensors.requestTemperatures();
+  float temp = sensors.getTempCByIndex(0);
+  if (!isnan(temp)) currentTemp = temp;
+}
+
+void saveTargetTemp() { EEPROM.put(TARGET_TEMP_ADDR, targetTemp); EEPROM.commit(); }
+void loadTargetTemp() { EEPROM.get(TARGET_TEMP_ADDR, targetTemp); if (isnan(targetTemp) || targetTemp < 5.0 || targetTemp > 35.0) targetTemp = 22.0; }
+void setupTime() { configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); }
+
+String getCurrentTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "--:--:--";
+  char timeString[20];
+  strftime(timeString, sizeof(timeString), "%H:%M:%S", &timeinfo);
+  return String(timeString);
+}
+
+String removeDiacritics(String str) {
+  str.replace("áč", "ac"); str.replace("é", "e"); str.replace("ě", "e");
+  str.replace("í", "i"); str.replace("ó", "o"); str.replace("ř", "r");
+  str.replace("š", "s"); str.replace("ť", "t"); str.replace("ú", "u");
+  str.replace("ů", "u"); str.replace("ý", "y"); str.replace("ž", "z");
+  str.replace("Á", "Ac"); str.replace("É", "E"); str.replace("Ě", "E");
+  str.replace("Í", "I"); str.replace("Ó", "O"); str.replace("Ř", "R");
+  str.replace("Š", "S"); str.replace("Ť", "T"); str.replace("Ú", "U");
+  str.replace("Ů", "U"); str.replace("Ý", "Y"); str.replace("Ž", "Z");
+  return str;
+}
+
+void fetchWeather() {
+  if (!isConnected) return;
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(WEATHER_CITY) + "&appid=" + String(WEATHER_API_KEY) + "&units=metric&lang=cz";
+  http.begin(url);
+  if (http.GET() == 200) {
+    DynamicJsonDocument doc(1500);
+    deserializeJson(doc, http.getString());
+    float temp = doc["main"]["temp"];
+    const char* desc = doc["weather"][0]["description"];
+    weatherTemp = String(temp, 1) + "C";
+    weatherDesc = removeDiacritics(String(desc)); 
+  }
+  http.end();
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, targetTempTopic) == 0) {
+    char buf[length + 1];
+    memcpy(buf, payload, length);
+    buf[length] = '\0';
+    float val = atof(buf);
+    if (!isnan(val) && val >= 5.0 && val <= 35.0) { targetTemp = val; saveTargetTemp(); }
+  }
+}
+
+bool mqttConnect() {
+  if (mqttClient.connected()) return true;
+  String clientId = "ESP32-CYD-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword)) {
+    mqttClient.subscribe(targetTempTopic);
+    return true;
+  }
+  return false;
+}
+
+void loop() {
+  checkTouch();
+  if (currentScreen == 0) drawHomeScreen();
+  else drawSettingsScreen();
+
+  server.handleClient(); 
+  
+  if (isConnected && !mqttClient.connected()) {
+    static unsigned long lastRec = 0;
+    if (millis() - lastRec > 10000) { lastRec = millis(); mqttConnect(); }
+  } else if (isConnected) {
+    mqttClient.loop();
+  }
+
+  static unsigned long lastTempRead = 0;
+  if (millis() - lastTempRead > 5000) {
+    readTemperature();
+    checkHeating();
+    lastTempRead = millis();
+  }
+  
+  if (millis() - lastPublish >= publishInterval) {
+    lastPublish = millis();
+    if (mqttClient.connected()) {
+      mqttClient.publish(tempTopic, String(currentTemp, 1).c_str(), true);
+      mqttClient.publish(relayStatusTopic, heatingOn ? "ON" : "OFF", true);
+    }
+  }
+  
+  static unsigned long lastWeatherFetch = 0;
+  if (millis() - lastWeatherFetch > 600000) {
+    fetchWeather();
+    lastWeatherFetch = millis();
+  }
+  
+  delay(10);
+}
