@@ -24,7 +24,7 @@
 #include "Ubuntu_Bold9pt7b.h"
 #include "Ubuntu_Bold12pt7b.h"
 #include "Ubuntu_Bold24pt7b.h"
-
+#include "Ubuntu_Regular12pt7b.h"
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -45,6 +45,16 @@ unsigned long bootMillis = 0;
 bool relayTestActive = false;
 unsigned long relayTestUntil = 0;
 bool relayStateBeforeTest = false;
+
+// Touch calibration is deliberately separate from thermostat settings.
+// If calibration is never completed, the original mapping remains in use.
+bool touchCalibrationValid = false;
+bool touchCalibrationActive = false;
+bool touchCalibrationTouchLatched = false;
+int touchCalibrationStep = 0;
+int touchCalRawX[4] = {0, 0, 0, 0};
+int touchCalRawY[4] = {0, 0, 0, 0};
+String touchCalibrationMessage = "";
 
 // Переменные интерфейса
 String oldTime = "";
@@ -84,6 +94,7 @@ DallasTemperature sensors(&oneWire);
 #define MQTT_CONFIG_ADDR 220
 #define SETTINGS_CONFIG_ADDR 300
 #define MQTT_FULL_CONFIG_ADDR 360
+#define TOUCH_CALIBRATION_ADDR 496  // reserved gap after MQTT settings; fits within EEPROM(512)
 
 // ШИМ подсветки
 #define LEDC_CHANNEL 0
@@ -95,6 +106,17 @@ DallasTemperature sensors(&oneWire);
 #define WEATHER_CITY "Valdice"
 
 XPT2046_Bitbang ts(TOUCH_MOSI, TOUCH_MISO, TOUCH_SCLK, TOUCH_CS);
+
+struct TouchCalibrationSettings {
+  uint16_t magic;
+  int16_t rawLeft;
+  int16_t rawRight;
+  int16_t rawTop;
+  int16_t rawBottom;
+};
+TouchCalibrationSettings touchCal = {0, 300, 30, 220, 20};
+const int TOUCH_CAL_X[4] = {25, 295, 295, 25};
+const int TOUCH_CAL_Y[4] = {25, 25, 215, 215};
 
 // Палитра (Modern Dark)
 #define DARK_BG      0x0841  
@@ -180,95 +202,80 @@ void loadFullMqttConfig();
 void updateBrightnessMode();
 void drawSettingsPage();
 void startRelayTest();
+void loadTouchCalibration();
+void saveTouchCalibration();
+void startTouchCalibration();
+void processTouchCalibration(TouchPoint p);
 
 // Веб-интерфейс со слайдером яркости
 const char* webPage = R"rawliteral(
 <!DOCTYPE html>
-<html>
+<html lang="cs">
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1" charset="UTF-8">
 <title>CYD Smart Termostat</title>
 <style>
-  :root{--bg:#0d1117;--card:#161b22;--accent:#238636;--text:#e6eef8;--border:#30363d}
-  body{margin:0;font-family:-apple-system,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;align-items:center;padding:20px}
-  .card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,0.5);margin-bottom:15px}
-  .title{font-size:22px;font-weight:600;text-align:center;margin-bottom:20px;color:#58a6ff}
-  .bigtemp{font-size:56px;font-weight:700;text-align:center;margin:10px 0;color:#58a6ff}
-  .target{font-size:22px;text-align:center;color:#c9d1d9;margin-bottom:20px}
-  .row{display:flex;justify-content:center;gap:15px;margin-top:10px}
-  .btn{flex:1;background:var(--accent);border:none;color:white;padding:14px;border-radius:10px;font-size:18px;font-weight:600;cursor:pointer}
-  .btn.blue{background:#1f6feb}
-  .slider-container{margin:20px 0 10px 0}
-  .slider-label{display:flex;justify-content:space-between;font-size:14px;color:#8b949e;margin-bottom:8px}
-  input[type=range]{width:100%;height:6px;background:#30363d;border-radius:5px;outline:none;-webkit-appearance:none}
-  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;background:#58a6ff;border-radius:50%;cursor:pointer}
-  input[type=text], input[type=password], input[type=number]{width:100%;padding:10px;background:#0d1117;border:1px solid var(--border);color:white;border-radius:8px;box-sizing:border-box;margin-top:5px;margin-bottom:12px}
-  label{font-size:13px;color:#8b949e}
+:root{--bg:#0d1117;--card:#161b22;--accent:#238636;--text:#e6eef8;--border:#30363d;--blue:#1f6feb}
+*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:var(--bg);color:var(--text);padding:14px;display:flex;flex-direction:column;align-items:center}
+.card{width:100%;max-width:520px;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 6px 18px #0005}
+.title{font-size:21px;font-weight:700;text-align:center;margin:2px 0 16px;color:#58a6ff}.bigtemp{font-size:50px;font-weight:700;text-align:center;color:#58a6ff;margin:8px 0}.target{text-align:center;font-size:21px;margin:8px 0 16px}.status{text-align:center;color:#9da7b3;font-size:14px;line-height:1.7}
+.row{display:flex;gap:10px;margin:10px 0}.btn{flex:1;border:0;border-radius:10px;padding:13px 10px;background:var(--accent);color:#fff;font-size:16px;font-weight:700;cursor:pointer}.blue{background:var(--blue)}.red{background:#b62324}.field{margin:12px 0}label{display:block;font-size:13px;color:#9da7b3;margin-bottom:5px}input[type=text],input[type=password],input[type=number]{width:100%;padding:11px;background:#0d1117;border:1px solid var(--border);color:white;border-radius:8px;font-size:16px}input[type=range]{width:100%;accent-color:#58a6ff}.rangehead{display:flex;justify-content:space-between;color:#9da7b3;font-size:14px;margin-bottom:8px}.checkrow{display:flex;align-items:center;gap:10px;margin:14px 0}.checkrow input{width:20px;height:20px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.note{font-size:13px;color:#9da7b3;line-height:1.5}.msg{font-size:14px;min-height:20px;color:#7ee787;line-height:1.5}
 </style>
 </head>
 <body>
   <div class="card">
     <div class="title" id="time">--:--:--</div>
     <div class="bigtemp" id="temp">--.- °C</div>
-    <div class="target">Cíl: <span id="target">--.-</span> °C</div>
-    <div class="row">
-      <button class="btn blue" onclick="changeTemp('inc')">+0.5°C</button>
-      <button class="btn" onclick="changeTemp('dec')">-0.5°C</button>
-    </div>
-    <div class="slider-container">
-      <div class="slider-label">
-        <span>Jas displeje</span>
-        <span id="bright-val">100%</span>
-      </div>
-      <input type="range" id="brightness" min="10" max="255" value="255" onchange="updateBrightness(this.value)">
-    </div>
+    <div class="target">Cílová teplota: <b><span id="target">--.-</span> °C</b></div>
+    <div class="row"><button class="btn blue" onclick="changeTemp('inc')">+0,5 °C</button><button class="btn" onclick="changeTemp('dec')">−0,5 °C</button></div>
+    <div class="status" id="liveStatus">Načítám stav…</div>
   </div>
+
   <div class="card">
-    <div class="title">MQTT konfigurace</div>
+    <div class="title">Nastavení termostatu</div>
+    <div class="field"><label>Hystereze zapnutí (°C)</label><input id="hLow" type="number" min="0.1" max="3" step="0.1"></div>
+    <div class="field"><label>Hystereze vypnutí (°C)</label><input id="hHigh" type="number" min="0.1" max="3" step="0.1"></div>
+    <div class="field"><label>Kalibrace teplotního čidla DS18B20 (°C, od −5 do +5)</label><input id="offset" type="number" min="-5" max="5" step="0.1"></div>
+    <div class="field"><div class="rangehead"><span>Jas displeje</span><b id="brightVal">100%</b></div><input id="brightness" type="range" min="10" max="255" value="255" oninput="document.getElementById('brightVal').textContent=Math.round(this.value/255*100)+'%'"></div>
+    <div class="checkrow"><input id="nightMode" type="checkbox"><label for="nightMode">Noční režim (22:00–06:00)</label></div>
+    <div class="field"><div class="rangehead"><span>Noční jas</span><b id="nightVal">14%</b></div><input id="nightBrightness" type="range" min="10" max="255" value="35" oninput="document.getElementById('nightVal').textContent=Math.round(this.value/255*100)+'%'"></div>
+    <div class="field"><label>Automatické ztlumení po nečinnosti (sekundy, 5–600)</label><input id="dimTimeout" type="number" min="5" max="600" step="5"></div>
+    <p class="note">Krok změny cílové teploty je pevně nastaven na 0,5 °C.</p>
+    <button class="btn" onclick="saveSettings()">Uložit nastavení</button><div class="msg" id="settingsMsg"></div>
+  </div>
+
+  <div class="card">
+    <div class="title">Diagnostika a servis</div>
+    <div class="status" id="diagnostics">Načítám diagnostiku…</div>
+    <div class="row"><button class="btn blue" onclick="relayTest()">Test relé (3 s)</button></div>
+    <div class="msg" id="serviceMsg"></div>
+  </div>
+
+  <div class="card">
+    <div class="title">Konfigurace MQTT</div>
     <form id="mqttForm">
-      <label>Server</label><input name="server" type="text" maxlength="63" placeholder="MQTT server">
-      <label>Port (prázdné = beze změny)</label><input name="port" type="number" min="1" max="65535" placeholder="např. 1883">
-      <label>Uživatel (prázdné = beze změny)</label><input name="user" type="text" maxlength="31">
-      <label>Heslo (prázdné = beze změny)</label><input name="password" type="password" maxlength="31">
+      <div class="field"><label>Server / IP</label><input name="server" id="mqttServer" type="text" maxlength="63" required></div>
+      <div class="grid"><div class="field"><label>Port</label><input name="port" id="mqttPort" type="number" min="1" max="65535" required></div><div class="field"><label>Uživatel</label><input name="user" id="mqttUser" type="text" maxlength="31"></div></div>
+      <div class="field"><label>Heslo (prázdné = ponechat současné)</label><input name="password" id="mqttPassword" type="password" maxlength="31" autocomplete="new-password"></div>
       <button class="btn" type="submit">Uložit MQTT</button>
-    </form>
-    <p><button class="btn blue" onclick="resetWifi()">Znovu nastavit Wi-Fi</button></p>
-    <p id="net-msg"></p>
+    </form><div class="msg" id="netMsg"></div>
+    <p class="note">Wi-Fi zařízení: <span id="ip">—</span></p>
+    <button class="btn red" onclick="resetWifi()">Znovu nastavit Wi-Fi</button>
   </div>
 <script>
-async function fetchStatus(){
-  try{
-    const res = await fetch('/status');
-    const j = await res.json();
-    document.getElementById('temp').innerText = j.temp.toFixed(1) + ' °C';
-    document.getElementById('target').innerText = j.target.toFixed(1);
-    document.getElementById('time').innerText = j.time;
-    document.getElementById('brightness').value = j.brightness;
-    document.getElementById('bright-val').innerText = Math.round((j.brightness/255)*100) + '%';
-  }catch(e){}
-}
-async function changeTemp(action){
-  await fetch('/' + action, {method:'POST'});
-  fetchStatus();
-}
-async function updateBrightness(val){
-  await fetch('/set_brightness?value=' + val, {method:'POST'});
-  document.getElementById('bright-val').innerText = Math.round((val/255)*100) + '%';
-}
-document.getElementById('mqttForm').addEventListener('submit', async e => {
-  e.preventDefault();
-  const data = new URLSearchParams(new FormData(e.target));
-  const r = await fetch('/mqtt-config', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:data});
-  document.getElementById('net-msg').innerText = r.ok ? 'Uloženo. MQTT se znovu připojí.' : 'Chyba ukládání.';
-});
-async function resetWifi(){
-  if(confirm('Zařízení se restartuje a otevře se Wi-Fi konfigurační portál. Pokračovat?')){
-    await fetch('/wifi-reset', {method:'POST'});
-    document.getElementById('net-msg').innerText='Zařízení se restartuje.';
-  }
-}
-setInterval(fetchStatus, 2000);
-window.onload = fetchStatus;
+let loaded=false;
+async function fetchStatus(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();
+ document.getElementById('temp').textContent=(j.sensorOk?Number(j.temp).toFixed(1):'--.-')+' °C';document.getElementById('target').textContent=Number(j.target).toFixed(1);document.getElementById('time').textContent=j.time;
+ document.getElementById('liveStatus').textContent='Topení: '+(j.relay==='ON'?'ZAPNUTO':'VYPNUTO')+' · Čidlo: '+(j.sensorOk?'OK':'CHYBA')+' · Wi-Fi: '+(j.wifi?'připojena':'odpojena')+' · MQTT: '+(j.mqtt?'připojeno':'odpojeno');
+ document.getElementById('diagnostics').innerHTML='Čidlo: <b>'+(j.sensorOk?'OK':'CHYBA')+'</b><br>Relé: <b>'+j.relay+'</b><br>Wi-Fi: '+(j.wifi?'připojena':'odpojena')+' · RSSI: '+j.rssi+' dBm<br>MQTT: '+(j.mqtt?'připojeno':'odpojeno')+'<br>IP: '+j.ip+'<br>Doba běhu: '+j.uptime+' min';document.getElementById('ip').textContent=j.ip;
+ if(!loaded){document.getElementById('hLow').value=j.hLow;document.getElementById('hHigh').value=j.hHigh;document.getElementById('offset').value=j.offset;document.getElementById('brightness').value=j.brightness;document.getElementById('brightVal').textContent=Math.round(j.brightness/255*100)+'%';document.getElementById('nightMode').checked=j.nightMode;document.getElementById('nightBrightness').value=j.nightBrightness;document.getElementById('nightVal').textContent=Math.round(j.nightBrightness/255*100)+'%';document.getElementById('dimTimeout').value=j.dimTimeout;document.getElementById('mqttServer').value=j.mqttServer;document.getElementById('mqttPort').value=j.mqttPort;document.getElementById('mqttUser').value=j.mqttUser;loaded=true;}
+ }catch(e){document.getElementById('liveStatus').textContent='Nepodařilo se načíst stav zařízení.'}}
+async function changeTemp(action){await fetch('/'+action,{method:'POST'});fetchStatus()}
+async function saveSettings(){const data=new URLSearchParams({hLow:document.getElementById('hLow').value,hHigh:document.getElementById('hHigh').value,offset:document.getElementById('offset').value,brightness:document.getElementById('brightness').value,nightMode:document.getElementById('nightMode').checked?'1':'0',nightBrightness:document.getElementById('nightBrightness').value,dimTimeout:document.getElementById('dimTimeout').value});const r=await fetch('/save-settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data});document.getElementById('settingsMsg').textContent=r.ok?'Nastavení uloženo.':'Chyba: zkontrolujte zadané hodnoty.';if(r.ok){loaded=false;fetchStatus()}}
+async function relayTest(){const r=await fetch('/relay-test',{method:'POST'});document.getElementById('serviceMsg').textContent=r.ok?'Test relé spuštěn na 3 sekundy.':await r.text();fetchStatus()}
+document.getElementById('mqttForm').addEventListener('submit',async e=>{e.preventDefault();const data=new URLSearchParams(new FormData(e.target));const r=await fetch('/mqtt-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data});document.getElementById('netMsg').textContent=r.ok?'MQTT nastavení uloženo.':'Chyba ukládání MQTT.';if(r.ok){document.getElementById('mqttPassword').value='';loaded=false;fetchStatus()}});
+async function resetWifi(){if(confirm('Zařízení se restartuje a znovu otevře Wi-Fi konfigurační portál. Pokračovat?')){await fetch('/wifi-reset',{method:'POST'});document.getElementById('netMsg').textContent='Zařízení se restartuje.'}}
+setInterval(fetchStatus,2500);window.onload=fetchStatus;
 </script>
 </body>
 </html>
@@ -283,6 +290,7 @@ void setup() {
   loadMqttConfig();
   loadThermostatSettings();
   loadFullMqttConfig();
+  loadTouchCalibration();
   bootMillis = millis();
   lastTouchMillis = millis();
   
@@ -315,69 +323,112 @@ void setup() {
 }
 
 void setupWebServer() {
-  server.on("/", HTTP_GET, []() { server.send(200, "text/html", webPage); });
+  server.on("/", HTTP_GET, []() { server.send(200, "text/html; charset=utf-8", webPage); });
   server.on("/status", HTTP_GET, []() {
-    String t = getCurrentTime();
+    String ip = isConnected ? WiFi.localIP().toString() : String("—");
+    long rssi = isConnected ? WiFi.RSSI() : 0;
     String payload = "{\"temp\":" + String(currentTemp, 1) +
-                     ",\"sensorOk\":" + String(sensorValid ? "true" : "false") +
-                     ",\"relay\":\"" + String(heatingOn ? "ON" : "OFF") + "\"" +
-                     ",\"target\":" + String(targetTemp, 1) +
-                     ",\"time\":\"" + t + "\"" +
-                     ",\"brightness\":" + String(displayBrightness) + "}";
+      ",\"sensorOk\":" + String(sensorValid ? "true" : "false") +
+      ",\"relay\":\"" + String(heatingOn ? "ON" : "OFF") + "\"" +
+      ",\"target\":" + String(targetTemp, 1) +
+      ",\"time\":\"" + getCurrentTime() + "\"" +
+      ",\"brightness\":" + String(displayBrightness) +
+      ",\"hLow\":" + String(hysteresisLow, 1) +
+      ",\"hHigh\":" + String(hysteresisHigh, 1) +
+      ",\"offset\":" + String(calibrationOffset, 1) +
+      ",\"nightMode\":" + String(nightModeEnabled ? "true" : "false") +
+      ",\"nightBrightness\":" + String(nightBrightness) +
+      ",\"dimTimeout\":" + String(dimTimeoutSeconds) +
+      ",\"wifi\":" + String(isConnected && WiFi.status() == WL_CONNECTED ? "true" : "false") +
+      ",\"mqtt\":" + String(mqttClient.connected() ? "true" : "false") +
+      ",\"rssi\":" + String(rssi) +
+      ",\"ip\":\"" + ip + "\"" +
+      ",\"uptime\":" + String(millis() / 60000UL) +
+      ",\"mqttServer\":\"" + String(mqttServer) + "\"" +
+      ",\"mqttPort\":" + String(mqttPort) +
+      ",\"mqttUser\":\"" + String(mqttUser) + "\"}";
     server.send(200, "application/json", payload);
   });
   server.on("/inc", HTTP_POST, []() {
-    targetTemp = min(35.0f, targetTemp + targetStep);
+    targetTemp = min(35.0f, targetTemp + 0.5f);
     saveTargetTemp();
     if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
     server.send(200, "text/plain", "ok");
   });
   server.on("/dec", HTTP_POST, []() {
-    targetTemp = max(5.0f, targetTemp - targetStep);
+    targetTemp = max(5.0f, targetTemp - 0.5f);
     saveTargetTemp();
     if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
     server.send(200, "text/plain", "ok");
-  });  
+  });
   server.on("/set_brightness", HTTP_POST, []() {
     if (server.hasArg("value")) {
       int val = server.arg("value").toInt();
       if (val >= 10 && val <= 255) {
-        displayBrightness = val;
-        saveBrightness();
-        updateBrightnessMode();
+        displayBrightness = val; saveBrightness(); updateBrightnessMode();
       }
     }
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/save-settings", HTTP_POST, []() {
+    if (!server.hasArg("hLow") || !server.hasArg("hHigh") || !server.hasArg("offset") ||
+        !server.hasArg("brightness") || !server.hasArg("nightBrightness") || !server.hasArg("dimTimeout")) {
+      server.send(400, "text/plain", "Chybí povinné hodnoty"); return;
+    }
+    float low = server.arg("hLow").toFloat();
+    float high = server.arg("hHigh").toFloat();
+    float offset = server.arg("offset").toFloat();
+    int bright = server.arg("brightness").toInt();
+    int nightBright = server.arg("nightBrightness").toInt();
+    int dim = server.arg("dimTimeout").toInt();
+    if (!isfinite(low) || low < 0.1f || low > 3.0f || !isfinite(high) || high < 0.1f || high > 3.0f ||
+        !isfinite(offset) || offset < -5.0f || offset > 5.0f || bright < 10 || bright > 255 ||
+        nightBright < 10 || nightBright > 255 || dim < 5 || dim > 600) {
+      server.send(400, "text/plain", "Hodnoty mimo povolený rozsah"); return;
+    }
+    hysteresisLow = low; hysteresisHigh = high; calibrationOffset = offset;
+    displayBrightness = bright; nightBrightness = nightBright; dimTimeoutSeconds = dim;
+    nightModeEnabled = server.hasArg("nightMode") && server.arg("nightMode") == "1";
+    targetStep = 0.5f; // Fixed step: always half a degree.
+    saveBrightness(); saveThermostatSettings(); readTemperature(); updateBrightnessMode();
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/relay-test", HTTP_POST, []() {
+    if (!sensorValid) { server.send(409, "text/plain", "Test relé nelze spustit: teplotní čidlo není v pořádku."); return; }
+    if (relayTestActive) { server.send(409, "text/plain", "Test relé už probíhá."); return; }
+    startRelayTest();
     server.send(200, "text/plain", "ok");
   });
   server.on("/mqtt-config", HTTP_POST, []() {
     if (server.hasArg("server") && server.arg("server").length() > 0) {
       String v = server.arg("server"); v.trim();
-      if (v.length() < sizeof(mqttServer)) v.toCharArray(mqttServer, sizeof(mqttServer));
+      if (v.length() >= sizeof(mqttServer)) { server.send(400, "text/plain", "Adresa MQTT serveru je příliš dlouhá"); return; }
+      v.toCharArray(mqttServer, sizeof(mqttServer));
     }
     if (server.hasArg("port") && server.arg("port").length() > 0) {
-      int p = server.arg("port").toInt();
-      if (p >= 1 && p <= 65535) mqttPort = p;
+      int portValue = server.arg("port").toInt();
+      if (portValue < 1 || portValue > 65535) { server.send(400, "text/plain", "Neplatný MQTT port"); return; }
+      mqttPort = portValue;
     }
     if (server.hasArg("user") && server.arg("user").length() > 0) {
-      String v = server.arg("user"); if (v.length() < sizeof(mqttUser)) v.toCharArray(mqttUser, sizeof(mqttUser));
+      String v = server.arg("user");
+      if (v.length() >= sizeof(mqttUser)) { server.send(400, "text/plain", "Uživatelské jméno je příliš dlouhé"); return; }
+      v.toCharArray(mqttUser, sizeof(mqttUser));
     }
     if (server.hasArg("password") && server.arg("password").length() > 0) {
-      String v = server.arg("password"); if (v.length() < sizeof(mqttPassword)) v.toCharArray(mqttPassword, sizeof(mqttPassword));
+      String v = server.arg("password");
+      if (v.length() >= sizeof(mqttPassword)) { server.send(400, "text/plain", "Heslo je příliš dlouhé"); return; }
+      v.toCharArray(mqttPassword, sizeof(mqttPassword));
     }
-    saveFullMqttConfig();
-    mqttClient.disconnect();
-    mqttClient.setServer(mqttServer, mqttPort);
+    saveFullMqttConfig(); mqttClient.disconnect(); mqttClient.setServer(mqttServer, mqttPort);
     server.send(200, "text/plain", "ok");
   });
   server.on("/wifi-reset", HTTP_POST, []() {
     server.send(200, "text/plain", "restarting");
-    delay(300);
-    wm.resetSettings();
-    ESP.restart();
+    delay(300); wm.resetSettings(); ESP.restart();
   });
   server.begin();
 }
-
 void setDisplayBrightness(int value) {
   value = constrain(value, 0, 255);
   ledcWrite(LEDC_CHANNEL, value);
@@ -416,7 +467,7 @@ void loadThermostatSettings() {
   hysteresisLow = cfg.hysteresisLow; hysteresisHigh = cfg.hysteresisHigh;
   calibrationOffset = cfg.calibrationOffset; dimTimeoutSeconds = cfg.dimTimeoutSeconds;
   nightBrightness = cfg.nightBrightness; nightModeEnabled = cfg.nightModeEnabled != 0;
-  targetStep = cfg.targetStepTenths / 10.0f;
+  targetStep = 0.5f; // Fixed target adjustment step: always 0.5 C.
 }
 void saveFullMqttConfig() {
   MqttSettings cfg = {};
@@ -583,15 +634,18 @@ void drawHomeScreen() {
     oldWeatherDesc = weatherDesc;
   }
 }
-
 void drawSettingsScreen() {
   if (redrawScreen) {
     tft.fillScreen(DARK_BG);
-    tft.fillRoundRect(10, 10, 50, 45, 6, 0x8400);
-    tft.drawRoundRect(10, 10, 50, 45, 6, BORDER_COLOR);
-    tft.setFreeFont(&Ubuntu_Bold12pt7b);
-    tft.setTextColor(TFT_WHITE, DARK_BG);
-    tft.drawString("<-", 22, 22);
+    // The back button is hidden during calibration because the first target
+    // deliberately occupies the top-left corner.
+    if (settingsPage != 6) {
+      tft.fillRoundRect(10, 10, 50, 45, 6, 0x8400);
+      tft.drawRoundRect(10, 10, 50, 45, 6, BORDER_COLOR);
+      tft.setFreeFont(&Ubuntu_Bold12pt7b);
+      tft.setTextColor(TFT_WHITE, DARK_BG);
+      tft.drawString("<-", 22, 22);
+    }
     if (settingsPage == 0) {
       tft.drawString("NASTAVENI", 80, 22);
       const char* labels[] = {"TEPLOTA", "DISPLEJ", "DIAGNOSTIKA", "SIT / MQTT", "SERVIS"};
@@ -607,7 +661,7 @@ void drawSettingsScreen() {
         tft.drawCentreString(labels[i],xs[i]+ws[i]/2,ys[i]+(hs[i]-15)/2,1);
       }
     } else {
-      const char* title = settingsPage==1 ? "TEPLOTA" : settingsPage==2 ? "DISPLEJ" : settingsPage==3 ? "DIAGNOSTIKA" : settingsPage==4 ? "SIT / MQTT" : "SERVIS";
+      const char* title = settingsPage==1 ? "TEPLOTA" : settingsPage==2 ? "DISPLEJ" : settingsPage==3 ? "DIAGNOSTIKA" : settingsPage==4 ? "SIT / MQTT" : settingsPage==5 ? "SERVIS" : "KALIBRACE DOTYKU";
       tft.drawString(title, 80, 22);
       tft.setFreeFont(&Ubuntu_Bold9pt7b);
       tft.setTextColor(TFT_WHITE,DARK_BG);
@@ -622,7 +676,8 @@ void drawSettingsScreen() {
         tft.drawString("Nocni rezim: " + String(nightModeEnabled ? "ZAP" : "VYP"), 18, 105);
         tft.drawString("Nocni jas: " + String(nightBrightness*100/255) + "%", 18, 140);
         tft.drawString("Ztmaveni: " + String(dimTimeoutSeconds) + " s", 18, 175);
-        tft.drawString("Tap: jas +/- | nocni rezim | cas", 18, 212);
+        tft.setTextColor(0x07FF,DARK_BG);
+        tft.drawString(touchCalibrationMessage.length() ? touchCalibrationMessage : "Kalibrace dotyku: stiskni zde", 18, 212);
       } else if (settingsPage == 3) {
         tft.drawString("DS18B20: " + String(sensorValid ? "OK" : "CHYBA"), 18, 67);
         tft.drawString("Teplota: " + String(sensorValid ? currentTemp : -127.0f,1) + " C", 18, 91);
@@ -646,6 +701,22 @@ void drawSettingsScreen() {
         tft.drawRoundRect(20, 165, 280, 45, 7, BORDER_COLOR);
         tft.setTextColor(TFT_WHITE,0x7800);
         tft.drawCentreString("TEST RELE",160,179,1);
+      } else if (settingsPage == 6) {
+        tft.setFreeFont(&Ubuntu_Bold9pt7b);
+        tft.setTextColor(TFT_WHITE, DARK_BG);
+        if (touchCalibrationActive) {
+          tft.drawCentreString("Dotkni se krize a pak uvolni", 160, 58, 1);
+          tft.drawCentreString(String("Bod ") + String(touchCalibrationStep + 1) + " / 4", 160, 82, 1);
+          tft.drawCentreString("Nemen nastaveni pri kalibraci", 160, 103, 1);
+          int cx = TOUCH_CAL_X[touchCalibrationStep];
+          int cy = TOUCH_CAL_Y[touchCalibrationStep];
+          tft.drawLine(cx - 12, cy, cx + 12, cy, TFT_CYAN);
+          tft.drawLine(cx, cy - 12, cx, cy + 12, TFT_CYAN);
+          tft.drawCircle(cx, cy, 5, TFT_WHITE);
+        } else {
+          tft.drawCentreString(touchCalibrationMessage.length() ? touchCalibrationMessage : "Kalibrace dotyku", 160, 95, 1);
+          tft.drawCentreString("Tap pro opakovani", 160, 125, 1);
+        }
       }
       if (settingsPage==1 || settingsPage==2) {
         tft.setTextColor(0x07FF,DARK_BG);
@@ -672,16 +743,40 @@ void drawSettingsScreen() {
 
 void checkTouch() {
   TouchPoint p = ts.getTouch();
+
+  // Calibration has its own raw-touch path. Do not pass calibration taps to
+  // normal UI hit-testing, so the + / - buttons and existing hit zones cannot move.
+  if (touchCalibrationActive) {
+    if (p.x == 0 && p.y == 0) {
+      touchCalibrationTouchLatched = false;
+    } else if (!touchCalibrationTouchLatched) {
+      touchCalibrationTouchLatched = true;
+      lastTouchMillis = millis();
+      screenWakeUntil = lastTouchMillis + 10000UL;
+      processTouchCalibration(p);
+      delay(180);
+    }
+    return;
+  }
+
   if (p.x != 0 || p.y != 0) {
     lastTouchMillis = millis();
     screenWakeUntil = lastTouchMillis + 10000UL;
     updateBrightnessMode();
-    int displayX = map(p.x, 300, 30, 0, 320);
-    int displayY = map(p.y, 220, 20, 0, 240);
+    int displayX;
+    int displayY;
+    if (touchCalibrationValid) {
+      displayX = map(p.x, touchCal.rawLeft, touchCal.rawRight, 25, 295);
+      displayY = map(p.y, touchCal.rawTop, touchCal.rawBottom, 25, 215);
+    } else {
+      // Original factory mapping preserved exactly until user completes calibration.
+      displayX = map(p.x, 300, 30, 0, 320);
+      displayY = map(p.y, 220, 20, 0, 240);
+    }
     if(displayX > 0 && displayX < 320 && displayY > 0 && displayY < 240) {
       if (currentScreen == 0) handleHomeTouch(displayX, displayY);
       else handleSettingsTouch(displayX, displayY);
-      delay(200); 
+      delay(200);
     }
   }
 }
@@ -736,7 +831,7 @@ void handleSettingsTouch(int x, int y) {
     } else if (y >= 151 && y < 181) {
       calibrationOffset = constrain(calibrationOffset + d, -5.0f, 5.0f);
     } else if (y >= 181 && y <= 230) {
-      targetStep = targetStep < 0.5f ? 0.5f : 0.1f;
+      targetStep = 0.5f; // Fixed step; no user-selectable step.
     } else return;
     saveThermostatSettings(); redrawScreen=true; return;
   }
@@ -745,8 +840,13 @@ void handleSettingsTouch(int x, int y) {
     else if (y >= 91 && y < 121) nightModeEnabled = !nightModeEnabled;
     else if (y >= 121 && y < 151) nightBrightness = constrain(nightBrightness + (x < 160 ? -10 : 10), 10, 255);
     else if (y >= 151 && y < 181) dimTimeoutSeconds = (dimTimeoutSeconds >= 60) ? 15 : dimTimeoutSeconds + 15;
+    else if (y >= 190 && y <= 235) { startTouchCalibration(); return; }
     else return;
     saveBrightness(); saveThermostatSettings(); updateBrightnessMode(); redrawScreen=true; return;
+  }
+  if (settingsPage == 6 && !touchCalibrationActive) {
+    startTouchCalibration();
+    return;
   }
   if (settingsPage == 5 && y >= 160 && y <= 215) { startRelayTest(); redrawScreen=true; return; }
   if (settingsPage == 4 && y >= 185) {
@@ -798,6 +898,104 @@ void readTemperature() {
     heatingOn = false;
     digitalWrite(RELAY_PIN, HIGH);
   }
+}
+
+void loadTouchCalibration() {
+  TouchCalibrationSettings stored;
+  EEPROM.get(TOUCH_CALIBRATION_ADDR, stored);
+  // Magic + plausible span check prevents uninitialized EEPROM bytes being used.
+  if (stored.magic == 0x5443 && stored.rawLeft > stored.rawRight && stored.rawTop > stored.rawBottom &&
+      ((int)stored.rawLeft - (int)stored.rawRight) >= 100 &&
+      ((int)stored.rawTop - (int)stored.rawBottom) >= 100 &&
+      stored.rawLeft >= 0 && stored.rawLeft <= 4095 && stored.rawRight >= 0 && stored.rawRight <= 4095 &&
+      stored.rawTop >= 0 && stored.rawTop <= 4095 && stored.rawBottom >= 0 && stored.rawBottom <= 4095) {
+    touchCal = stored;
+    touchCalibrationValid = true;
+    Serial.println("Touch calibration loaded from EEPROM");
+  } else {
+    touchCal = {0, 300, 30, 220, 20};
+    touchCalibrationValid = false;
+    Serial.println("Using original touch coordinates; no valid calibration stored");
+  }
+}
+
+void saveTouchCalibration() {
+  touchCal.magic = 0x5443;
+  EEPROM.put(TOUCH_CALIBRATION_ADDR, touchCal);
+  EEPROM.commit();
+  touchCalibrationValid = true;
+}
+
+void startTouchCalibration() {
+  touchCalibrationActive = true;
+  // The tap that opened calibration must be released before the first target
+  // can be captured; otherwise that menu tap could become point #1.
+  touchCalibrationTouchLatched = true;
+  touchCalibrationStep = 0;
+  touchCalibrationMessage = "";
+  currentScreen = 1;
+  settingsPage = 6;
+  redrawScreen = true;
+  Serial.println("Touch calibration started; existing calibration will remain until all 4 points pass validation");
+}
+
+void processTouchCalibration(TouchPoint p) {
+  // Average a few readings from the same press to reduce noise.
+  long sumX = 0, sumY = 0;
+  int samples = 0;
+  for (int i = 0; i < 7; ++i) {
+    TouchPoint q = (i == 0) ? p : ts.getTouch();
+    if (q.x != 0 || q.y != 0) {
+      sumX += q.x;
+      sumY += q.y;
+      samples++;
+    }
+    delay(8);
+  }
+  if (samples < 3) return;
+
+  touchCalRawX[touchCalibrationStep] = (int)(sumX / samples);
+  touchCalRawY[touchCalibrationStep] = (int)(sumY / samples);
+  touchCalibrationStep++;
+
+  if (touchCalibrationStep < 4) {
+    redrawScreen = true;
+    return;
+  }
+
+  TouchCalibrationSettings candidate = {};
+  candidate.magic = 0x5443;
+  candidate.rawLeft = (int16_t)((touchCalRawX[0] + touchCalRawX[3]) / 2);
+  candidate.rawRight = (int16_t)((touchCalRawX[1] + touchCalRawX[2]) / 2);
+  candidate.rawTop = (int16_t)((touchCalRawY[0] + touchCalRawY[1]) / 2);
+  candidate.rawBottom = (int16_t)((touchCalRawY[2] + touchCalRawY[3]) / 2);
+
+  // Preserve the current panel orientation: the known-good mapping is
+  // decreasing on both raw axes. Reject reversed taps and suspiciously tiny spans.
+  bool valid = candidate.rawLeft > candidate.rawRight &&
+               candidate.rawTop > candidate.rawBottom &&
+               ((int)candidate.rawLeft - (int)candidate.rawRight) >= 100 &&
+               ((int)candidate.rawTop - (int)candidate.rawBottom) >= 100 &&
+               candidate.rawLeft >= 0 && candidate.rawLeft <= 4095 &&
+               candidate.rawRight >= 0 && candidate.rawRight <= 4095 &&
+               candidate.rawTop >= 0 && candidate.rawTop <= 4095 &&
+               candidate.rawBottom >= 0 && candidate.rawBottom <= 4095;
+
+  touchCalibrationActive = false;
+  touchCalibrationTouchLatched = false;
+  if (valid) {
+    touchCal = candidate;
+    saveTouchCalibration();
+    touchCalibrationMessage = "Kalibrace ulozena";
+    settingsPage = 2;
+    Serial.printf("Touch calibration saved: X %d -> %d, Y %d -> %d\n", touchCal.rawLeft, touchCal.rawRight, touchCal.rawTop, touchCal.rawBottom);
+  } else {
+    // Keep the previous calibration (or original mapping) intact on bad readings.
+    touchCalibrationMessage = "Kalibrace selhala";
+    settingsPage = 6;
+    Serial.println("Touch calibration rejected; previous coordinates preserved");
+  }
+  redrawScreen = true;
 }
 
 void saveTargetTemp() { EEPROM.put(TARGET_TEMP_ADDR, targetTemp); EEPROM.commit(); }
