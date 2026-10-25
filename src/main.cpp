@@ -8,6 +8,7 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
+#include <OneWire.h>
 #include <DallasTemperature.h>
 #include <time.h>
 #include <vector>
@@ -17,9 +18,8 @@
 #include <HTTPClient.h>
 
 // Подключаем шрифты Ubuntu
-
-#include "FreeSansBold36pt7b.h"
 #include "FreeSansBold16pt7b.h"
+#include "FreeSansBold36pt7b.h"
 #include "Ubuntu_Bold7pt7b.h"
 #include "Ubuntu_Bold9pt7b.h"
 #include "Ubuntu_Bold12pt7b.h"
@@ -30,7 +30,21 @@ TFT_eSPI tft = TFT_eSPI();
 
 // Текущий экран: 0 - Главный, 1 - Настройки
 int currentScreen = 0;
+int settingsPage = 0; // 0=категории, 1=температура, 2=экран, 3=диагностика, 4=сеть, 5=сервис
 bool redrawScreen = true;
+bool sensorValid = false;
+float calibrationOffset = 0.0f;
+float targetStep = 0.5f;
+int dimTimeoutSeconds = 30;
+int nightBrightness = 35;
+bool nightModeEnabled = true;
+int appliedBrightness = -1;
+unsigned long lastTouchMillis = 0;
+unsigned long screenWakeUntil = 0;
+unsigned long bootMillis = 0;
+bool relayTestActive = false;
+unsigned long relayTestUntil = 0;
+bool relayStateBeforeTest = false;
 
 // Переменные интерфейса
 String oldTime = "";
@@ -39,6 +53,7 @@ float oldTarget = -100;
 bool oldHeating = false;
 bool oldWifi = false;
 bool oldMqttConnected = false;
+bool oldSensorValid = false;
 
 String weatherTemp = "";
 String weatherDesc = "";
@@ -66,7 +81,9 @@ DallasTemperature sensors(&oneWire);
 // EEPROM Адреса
 #define TARGET_TEMP_ADDR 200
 #define BRIGHTNESS_ADDR  210
-#define MQTT_CONFIG_ADDR 220 
+#define MQTT_CONFIG_ADDR 220
+#define SETTINGS_CONFIG_ADDR 300
+#define MQTT_FULL_CONFIG_ADDR 360
 
 // ШИМ подсветки
 #define LEDC_CHANNEL 0
@@ -95,6 +112,24 @@ int mqttPort = 1883;
 char mqttUser[32] = "esp32";
 char mqttPassword[32] = "Energy654.";
 
+struct ThermostatSettings {
+  uint32_t magic;
+  float hysteresisLow;
+  float hysteresisHigh;
+  float calibrationOffset;
+  int32_t dimTimeoutSeconds;
+  int32_t nightBrightness;
+  uint8_t nightModeEnabled;
+  uint8_t targetStepTenths;
+};
+
+struct MqttSettings {
+  char server[64];
+  int32_t port;
+  char user[32];
+  char password[32];
+};
+
 const char* tempTopic = "esp32/temperature";
 const char* targetTempTopic = "esp32/targetTemp";
 const char* relayStatusTopic = "esp32/rele";
@@ -113,7 +148,7 @@ int displayBrightness = 255;
 // NTP
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
-const int daylightOffset_sec = 0;
+const int daylightOffset_sec = 3600; // летнее время для Чехии
 
 // Прототипы
 void drawHomeScreen();
@@ -138,6 +173,13 @@ void checkHeating();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 bool mqttConnect();
 void setupWebServer();
+void saveThermostatSettings();
+void loadThermostatSettings();
+void saveFullMqttConfig();
+void loadFullMqttConfig();
+void updateBrightnessMode();
+void drawSettingsPage();
+void startRelayTest();
 
 // Веб-интерфейс со слайдером яркости
 const char* webPage = R"rawliteral(
@@ -181,6 +223,18 @@ const char* webPage = R"rawliteral(
       <input type="range" id="brightness" min="10" max="255" value="255" onchange="updateBrightness(this.value)">
     </div>
   </div>
+  <div class="card">
+    <div class="title">MQTT konfigurace</div>
+    <form id="mqttForm">
+      <label>Server</label><input name="server" type="text" maxlength="63" placeholder="MQTT server">
+      <label>Port (prázdné = beze změny)</label><input name="port" type="number" min="1" max="65535" placeholder="např. 1883">
+      <label>Uživatel (prázdné = beze změny)</label><input name="user" type="text" maxlength="31">
+      <label>Heslo (prázdné = beze změny)</label><input name="password" type="password" maxlength="31">
+      <button class="btn" type="submit">Uložit MQTT</button>
+    </form>
+    <p><button class="btn blue" onclick="resetWifi()">Znovu nastavit Wi-Fi</button></p>
+    <p id="net-msg"></p>
+  </div>
 <script>
 async function fetchStatus(){
   try{
@@ -201,6 +255,18 @@ async function updateBrightness(val){
   await fetch('/set_brightness?value=' + val, {method:'POST'});
   document.getElementById('bright-val').innerText = Math.round((val/255)*100) + '%';
 }
+document.getElementById('mqttForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const data = new URLSearchParams(new FormData(e.target));
+  const r = await fetch('/mqtt-config', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:data});
+  document.getElementById('net-msg').innerText = r.ok ? 'Uloženo. MQTT se znovu připojí.' : 'Chyba ukládání.';
+});
+async function resetWifi(){
+  if(confirm('Zařízení se restartuje a otevře se Wi-Fi konfigurační portál. Pokračovat?')){
+    await fetch('/wifi-reset', {method:'POST'});
+    document.getElementById('net-msg').innerText='Zařízení se restartuje.';
+  }
+}
 setInterval(fetchStatus, 2000);
 window.onload = fetchStatus;
 </script>
@@ -215,12 +281,17 @@ void setup() {
   loadTargetTemp();
   loadBrightness();
   loadMqttConfig();
+  loadThermostatSettings();
+  loadFullMqttConfig();
+  bootMillis = millis();
+  lastTouchMillis = millis();
   
   sensors.begin();
   readTemperature();
   
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
+  heatingOn = false;
 
   tft.init();
   tft.setRotation(1);
@@ -229,7 +300,8 @@ void setup() {
   
   ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
   ledcAttachPin(TFT_BL, LEDC_CHANNEL);
-  setDisplayBrightness(displayBrightness); 
+  setDisplayBrightness(displayBrightness);
+  appliedBrightness = displayBrightness; 
   
   ts.begin();
   setupWiFi();
@@ -246,20 +318,22 @@ void setupWebServer() {
   server.on("/", HTTP_GET, []() { server.send(200, "text/html", webPage); });
   server.on("/status", HTTP_GET, []() {
     String t = getCurrentTime();
-    String payload = "{\"temp\":" + String(currentTemp, 1) + 
-                     ",\"target\":" + String(targetTemp, 1) + 
+    String payload = "{\"temp\":" + String(currentTemp, 1) +
+                     ",\"sensorOk\":" + String(sensorValid ? "true" : "false") +
+                     ",\"relay\":\"" + String(heatingOn ? "ON" : "OFF") + "\"" +
+                     ",\"target\":" + String(targetTemp, 1) +
                      ",\"time\":\"" + t + "\"" +
                      ",\"brightness\":" + String(displayBrightness) + "}";
     server.send(200, "application/json", payload);
   });
   server.on("/inc", HTTP_POST, []() {
-    targetTemp = min(35.0, targetTemp + 0.5);
+    targetTemp = min(35.0f, targetTemp + targetStep);
     saveTargetTemp();
     if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
     server.send(200, "text/plain", "ok");
   });
   server.on("/dec", HTTP_POST, []() {
-    targetTemp = max(5.0, targetTemp - 0.5);
+    targetTemp = max(5.0f, targetTemp - targetStep);
     saveTargetTemp();
     if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
     server.send(200, "text/plain", "ok");
@@ -269,20 +343,123 @@ void setupWebServer() {
       int val = server.arg("value").toInt();
       if (val >= 10 && val <= 255) {
         displayBrightness = val;
-        setDisplayBrightness(displayBrightness);
         saveBrightness();
+        updateBrightnessMode();
       }
     }
     server.send(200, "text/plain", "ok");
   });
+  server.on("/mqtt-config", HTTP_POST, []() {
+    if (server.hasArg("server") && server.arg("server").length() > 0) {
+      String v = server.arg("server"); v.trim();
+      if (v.length() < sizeof(mqttServer)) v.toCharArray(mqttServer, sizeof(mqttServer));
+    }
+    if (server.hasArg("port") && server.arg("port").length() > 0) {
+      int p = server.arg("port").toInt();
+      if (p >= 1 && p <= 65535) mqttPort = p;
+    }
+    if (server.hasArg("user") && server.arg("user").length() > 0) {
+      String v = server.arg("user"); if (v.length() < sizeof(mqttUser)) v.toCharArray(mqttUser, sizeof(mqttUser));
+    }
+    if (server.hasArg("password") && server.arg("password").length() > 0) {
+      String v = server.arg("password"); if (v.length() < sizeof(mqttPassword)) v.toCharArray(mqttPassword, sizeof(mqttPassword));
+    }
+    saveFullMqttConfig();
+    mqttClient.disconnect();
+    mqttClient.setServer(mqttServer, mqttPort);
+    server.send(200, "text/plain", "ok");
+  });
+  server.on("/wifi-reset", HTTP_POST, []() {
+    server.send(200, "text/plain", "restarting");
+    delay(300);
+    wm.resetSettings();
+    ESP.restart();
+  });
   server.begin();
 }
 
-void setDisplayBrightness(int value) { ledcWrite(LEDC_CHANNEL, value); }
+void setDisplayBrightness(int value) {
+  value = constrain(value, 0, 255);
+  ledcWrite(LEDC_CHANNEL, value);
+  appliedBrightness = value;
+}
 void saveBrightness() { EEPROM.put(BRIGHTNESS_ADDR, displayBrightness); EEPROM.commit(); }
 void loadBrightness() { EEPROM.get(BRIGHTNESS_ADDR, displayBrightness); if (displayBrightness < 10 || displayBrightness > 255) displayBrightness = 255; }
 void saveMqttConfig() { EEPROM.put(MQTT_CONFIG_ADDR, mqttServer); EEPROM.commit(); }
-void loadMqttConfig() { EEPROM.get(MQTT_CONFIG_ADDR, mqttServer); }
+void loadMqttConfig() {
+  char stored[64] = {0};
+  EEPROM.get(MQTT_CONFIG_ADDR, stored);
+  if (stored[0] != '\0' && strnlen(stored, sizeof(stored)) < sizeof(stored)) {
+    strncpy(mqttServer, stored, sizeof(mqttServer) - 1);
+    mqttServer[sizeof(mqttServer) - 1] = '\0';
+  }
+}
+void saveThermostatSettings() {
+  ThermostatSettings cfg = {0x43594431UL, hysteresisLow, hysteresisHigh, calibrationOffset,
+    dimTimeoutSeconds, nightBrightness, (uint8_t)nightModeEnabled,
+    (uint8_t)round(targetStep * 10.0f)};
+  EEPROM.put(SETTINGS_CONFIG_ADDR, cfg);
+  EEPROM.commit();
+}
+void loadThermostatSettings() {
+  ThermostatSettings cfg;
+  EEPROM.get(SETTINGS_CONFIG_ADDR, cfg);
+  if (cfg.magic != 0x43594431UL || !isfinite(cfg.hysteresisLow) || cfg.hysteresisLow < 0.1f || cfg.hysteresisLow > 3.0f ||
+      !isfinite(cfg.hysteresisHigh) || cfg.hysteresisHigh < 0.1f || cfg.hysteresisHigh > 3.0f ||
+      !isfinite(cfg.calibrationOffset) || cfg.calibrationOffset < -5.0f || cfg.calibrationOffset > 5.0f ||
+      cfg.dimTimeoutSeconds < 5 || cfg.dimTimeoutSeconds > 600 || cfg.nightBrightness < 10 || cfg.nightBrightness > 255 || cfg.targetStepTenths < 1 || cfg.targetStepTenths > 10) {
+    hysteresisLow = 0.2f; hysteresisHigh = 0.3f; calibrationOffset = 0.0f;
+    dimTimeoutSeconds = 30; nightBrightness = 35; nightModeEnabled = true; targetStep = 0.5f;
+    saveThermostatSettings();
+    return;
+  }
+  hysteresisLow = cfg.hysteresisLow; hysteresisHigh = cfg.hysteresisHigh;
+  calibrationOffset = cfg.calibrationOffset; dimTimeoutSeconds = cfg.dimTimeoutSeconds;
+  nightBrightness = cfg.nightBrightness; nightModeEnabled = cfg.nightModeEnabled != 0;
+  targetStep = cfg.targetStepTenths / 10.0f;
+}
+void saveFullMqttConfig() {
+  MqttSettings cfg = {};
+  strncpy(cfg.server, mqttServer, sizeof(cfg.server)-1);
+  cfg.port = mqttPort;
+  strncpy(cfg.user, mqttUser, sizeof(cfg.user)-1);
+  strncpy(cfg.password, mqttPassword, sizeof(cfg.password)-1);
+  EEPROM.put(MQTT_FULL_CONFIG_ADDR, cfg);
+  EEPROM.commit();
+}
+void loadFullMqttConfig() {
+  MqttSettings cfg;
+  EEPROM.get(MQTT_FULL_CONFIG_ADDR, cfg);
+  if (cfg.server[0] == '\0' || strnlen(cfg.server, sizeof(cfg.server)) >= sizeof(cfg.server) || cfg.port < 1 || cfg.port > 65535) return;
+  strncpy(mqttServer, cfg.server, sizeof(mqttServer)-1); mqttServer[sizeof(mqttServer)-1] = '\0';
+  mqttPort = cfg.port;
+  if (strnlen(cfg.user, sizeof(cfg.user)) < sizeof(cfg.user)) { strncpy(mqttUser, cfg.user, sizeof(mqttUser)-1); mqttUser[sizeof(mqttUser)-1]='\0'; }
+  if (strnlen(cfg.password, sizeof(cfg.password)) < sizeof(cfg.password)) { strncpy(mqttPassword, cfg.password, sizeof(mqttPassword)-1); mqttPassword[sizeof(mqttPassword)-1]='\0'; }
+}
+void updateBrightnessMode() {
+  int wanted = displayBrightness;
+  unsigned long now = millis();
+  // После касания на 10 секунд возвращаем обычную яркость, в том числе ночью.
+  if (screenWakeUntil != 0 && (long)(screenWakeUntil - now) > 0) {
+    wanted = displayBrightness;
+  } else {
+    struct tm ti;
+    bool isNight = false;
+    if (nightModeEnabled && getLocalTime(&ti, 10)) isNight = (ti.tm_hour >= 22 || ti.tm_hour < 6);
+    if (isNight) wanted = min(wanted, nightBrightness);
+    else if (dimTimeoutSeconds > 0 && now - lastTouchMillis >= (unsigned long)dimTimeoutSeconds * 1000UL)
+      wanted = min(wanted, max(10, displayBrightness / 5));
+  }
+  if (wanted != appliedBrightness) setDisplayBrightness(wanted);
+}
+void startRelayTest() {
+  if (relayTestActive || !sensorValid) return;
+  relayStateBeforeTest = heatingOn;
+  relayTestActive = true;
+  relayTestUntil = millis() + 3000UL;
+  heatingOn = !relayStateBeforeTest;
+  digitalWrite(RELAY_PIN, heatingOn ? LOW : HIGH);
+}
 
 void drawHomeScreen() {
   if (redrawScreen) {
@@ -410,30 +587,95 @@ void drawHomeScreen() {
 void drawSettingsScreen() {
   if (redrawScreen) {
     tft.fillScreen(DARK_BG);
-    tft.fillRoundRect(10, 10, 50, 45, 6, 0x8400); 
+    tft.fillRoundRect(10, 10, 50, 45, 6, 0x8400);
     tft.drawRoundRect(10, 10, 50, 45, 6, BORDER_COLOR);
     tft.setFreeFont(&Ubuntu_Bold12pt7b);
-    tft.setTextColor(TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, DARK_BG);
     tft.drawString("<-", 22, 22);
-    tft.drawString("NASTAVENI", 80, 22);
-
-    tft.fillRoundRect(10, 65, 300, 75, 6, CARD_BG);
-    tft.drawRoundRect(10, 65, 300, 75, 6, BORDER_COLOR);
-    tft.setFreeFont(&Ubuntu_Bold9pt7b);
-    tft.setTextColor(TFT_LIGHTGREY);
-    tft.drawString("Jas displeje", 20, 75);
-    
-    tft.fillRoundRect(20, 100, 60, 32, 6, TFT_RED);
-    tft.fillRoundRect(240, 100, 60, 32, 6, TFT_BLUE);
-    tft.drawString("-", 47, 105);
-    tft.drawString("+", 267, 105);
+    if (settingsPage == 0) {
+      tft.drawString("NASTAVENI", 80, 22);
+      const char* labels[] = {"TEPLOTA", "DISPLEJ", "DIAGNOSTIKA", "SIT / MQTT", "SERVIS"};
+      const int xs[] = {10,165,10,165,10};
+      const int ys[] = {65,65,125,125,185};
+      const int ws[] = {145,145,145,145,300};
+      const int hs[] = {50,50,50,50,43};
+      for (int i=0;i<5;i++) {
+        tft.fillRoundRect(xs[i],ys[i],ws[i],hs[i],7,CARD_BG);
+        tft.drawRoundRect(xs[i],ys[i],ws[i],hs[i],7,BORDER_COLOR);
+        tft.setFreeFont(&Ubuntu_Bold9pt7b);
+        tft.setTextColor(i==4 ? TXT_ORANGE : TFT_WHITE,CARD_BG);
+        tft.drawCentreString(labels[i],xs[i]+ws[i]/2,ys[i]+(hs[i]-15)/2,1);
+      }
+    } else {
+      const char* title = settingsPage==1 ? "TEPLOTA" : settingsPage==2 ? "DISPLEJ" : settingsPage==3 ? "DIAGNOSTIKA" : settingsPage==4 ? "SIT / MQTT" : "SERVIS";
+      tft.drawString(title, 80, 22);
+      tft.setFreeFont(&Ubuntu_Bold9pt7b);
+      tft.setTextColor(TFT_WHITE,DARK_BG);
+      if (settingsPage == 1) {
+        tft.drawString("Cil: " + String(targetTemp,1) + " C  krok " + String(targetStep,1), 18, 70);
+        tft.drawString("Hyst. zap: " + String(hysteresisLow,1) + " C", 18, 105);
+        tft.drawString("Hyst. vyp: " + String(hysteresisHigh,1) + " C", 18, 140);
+        tft.drawString("Kalibrace: " + String(calibrationOffset,1) + " C", 18, 175);
+        tft.drawString("Dotyk vlevo = minus, vpravo = plus", 18, 212);
+      } else if (settingsPage == 2) {
+        tft.drawString("Jas: " + String(displayBrightness*100/255) + "%", 18, 70);
+        tft.drawString("Nocni rezim: " + String(nightModeEnabled ? "ZAP" : "VYP"), 18, 105);
+        tft.drawString("Nocni jas: " + String(nightBrightness*100/255) + "%", 18, 140);
+        tft.drawString("Ztmaveni: " + String(dimTimeoutSeconds) + " s", 18, 175);
+        tft.drawString("Tap: jas +/- | nocni rezim | cas", 18, 212);
+      } else if (settingsPage == 3) {
+        tft.drawString("DS18B20: " + String(sensorValid ? "OK" : "CHYBA"), 18, 67);
+        tft.drawString("Teplota: " + String(sensorValid ? currentTemp : -127.0f,1) + " C", 18, 91);
+        tft.drawString("Rele: " + String(heatingOn ? "ZAPNUTO" : "VYPNUTO"), 18, 115);
+        tft.drawString("Wi-Fi: " + String(WiFi.status()==WL_CONNECTED ? "OK" : "ODPOJENO"), 18, 139);
+        tft.drawString("MQTT: " + String(mqttClient.connected() ? "OK" : "ODPOJENO"), 18, 163);
+        tft.drawString("IP: " + WiFi.localIP().toString(), 18, 187);
+        tft.drawString("Uptime: " + String((millis()-bootMillis)/60000UL) + " min", 18, 211);
+      } else if (settingsPage == 4) {
+        tft.drawString("Wi-Fi: " + String(WiFi.status()==WL_CONNECTED ? "PRIPOJENO" : "ODPOJENO"), 18, 70);
+        tft.drawString("IP: " + WiFi.localIP().toString(), 18, 100);
+        tft.drawString("MQTT: " + String(mqttServer), 18, 130);
+        tft.drawString("Port: " + String(mqttPort), 18, 155);
+        tft.drawString("Web nastaveni: http://" + WiFi.localIP().toString(), 18, 185);
+        tft.drawString("Wi-Fi reset pres webove rozhrani", 18, 212);
+      } else if (settingsPage == 5) {
+        tft.drawString("Test rele na 3 sekundy", 18, 75);
+        tft.drawString("Pouzivej jen pri bezpecnem servisu", 18, 100);
+        tft.drawString("Teplota senzoru: " + String(sensorValid ? "OK" : "CHYBA"), 18, 135);
+        tft.fillRoundRect(20, 165, 280, 45, 7, 0x7800);
+        tft.drawRoundRect(20, 165, 280, 45, 7, BORDER_COLOR);
+        tft.setTextColor(TFT_WHITE,0x7800);
+        tft.drawCentreString("TEST RELE",160,179,1);
+      }
+      if (settingsPage==1 || settingsPage==2) {
+        tft.setTextColor(0x07FF,DARK_BG);
+        tft.drawString("stisk vlevo - / vpravo +", 18, 226);
+      }
+    }
     redrawScreen = false;
+  }
+  // обновляем живые данные на странице диагностики без перерисовки интерфейса целиком
+  static unsigned long lastDiagRefresh = 0;
+  if (settingsPage == 3 && !redrawScreen && millis() - lastDiagRefresh >= 1000UL) {
+    lastDiagRefresh = millis();
+    tft.fillRect(15,60,225,165,CARD_BG);
+    tft.setFreeFont(&Ubuntu_Bold9pt7b); tft.setTextColor(TFT_WHITE,CARD_BG);
+    tft.drawString("DS18B20: " + String(sensorValid ? "OK" : "CHYBA"),18,67);
+    tft.drawString("Teplota: " + String(sensorValid ? currentTemp : -127.0f,1) + " C",18,91);
+    tft.drawString("Rele: " + String(heatingOn ? "ZAPNUTO" : "VYPNUTO"),18,115);
+    tft.drawString("Wi-Fi: " + String(WiFi.status()==WL_CONNECTED ? "OK" : "ODPOJENO"),18,139);
+    tft.drawString("MQTT: " + String(mqttClient.connected() ? "OK" : "ODPOJENO"),18,163);
+    tft.drawString("IP: " + WiFi.localIP().toString(),18,187);
+    tft.drawString("Uptime: " + String((millis()-bootMillis)/60000UL) + " min",18,211);
   }
 }
 
 void checkTouch() {
   TouchPoint p = ts.getTouch();
-  if (p.x != 0 || p.y != 0) { 
+  if (p.x != 0 || p.y != 0) {
+    lastTouchMillis = millis();
+    screenWakeUntil = lastTouchMillis + 10000UL;
+    updateBrightnessMode();
     int displayX = map(p.x, 300, 30, 0, 320);
     int displayY = map(p.y, 220, 20, 0, 240);
     if(displayX > 0 && displayX < 320 && displayY > 0 && displayY < 240) {
@@ -453,13 +695,13 @@ void handleHomeTouch(int x, int y) {
   }
   // Кнопка Плюс (+) - НЕ ТРОНУТА
   if (x >= 245 && x <= 310 && y >= 68 && y <= 126) {
-    targetTemp = min(35.0, targetTemp + 0.5);
+    targetTemp = min(35.0f, targetTemp + targetStep);
     saveTargetTemp();
     if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
   }
   // Кнопка Минус (-) - НЕ ТРОНУТА
   if (x >= 245 && x <= 310 && y >= 133 && y <= 191) {
-    targetTemp = max(5.0, targetTemp - 0.5);
+    targetTemp = max(5.0f, targetTemp - targetStep);
     saveTargetTemp();
     if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
   }
@@ -467,35 +709,72 @@ void handleHomeTouch(int x, int y) {
 
 void handleSettingsTouch(int x, int y) {
   if (x >= 10 && x <= 60 && y >= 10 && y <= 55) {
-    currentScreen = 0;
-    redrawScreen = true; 
-    oldTime = "";        
-    oldTemp = -100;
-    oldTarget = -100;
-    oldHeating = !heatingOn;
-    oldWeatherTemp = "";
+    if (settingsPage != 0) settingsPage = 0;
+    else { currentScreen = 0; oldTime=""; oldTemp=-100; oldTarget=-100; oldHeating=!heatingOn; oldWeatherTemp=""; }
+    redrawScreen = true;
     return;
   }
-  if (x >= 20 && x <= 80 && y >= 100 && y <= 132) {
-    displayBrightness = max(20, displayBrightness - 25);
-    setDisplayBrightness(displayBrightness);
-    saveBrightness();
+  if (settingsPage == 0) {
+    if (y >= 65 && y <= 115 && x >= 10 && x <= 155) settingsPage = 1;
+    else if (y >= 65 && y <= 115 && x >= 165 && x <= 310) settingsPage = 2;
+    else if (y >= 125 && y <= 175 && x >= 10 && x <= 155) settingsPage = 3;
+    else if (y >= 125 && y <= 175 && x >= 165 && x <= 310) settingsPage = 4;
+    else if (y >= 185 && x >= 10 && x <= 310) settingsPage = 5;
+    redrawScreen = true;
+    return;
   }
-  if (x >= 240 && x <= 300 && y >= 100 && y <= 132) {
-    displayBrightness = min(255, displayBrightness + 25);
-    setDisplayBrightness(displayBrightness);
-    saveBrightness();
+  if (settingsPage == 1) {
+    float d = (x < 160) ? -0.1f : 0.1f;
+    if (y >= 60 && y < 91) {
+      targetTemp = constrain(targetTemp + ((x < 160) ? -targetStep : targetStep), 5.0f, 35.0f);
+      saveTargetTemp();
+      if (mqttClient.connected()) mqttClient.publish(targetTempTopic, String(targetTemp, 1).c_str(), true);
+    } else if (y >= 91 && y < 121) {
+      hysteresisLow = constrain(hysteresisLow + d, 0.1f, 3.0f);
+    } else if (y >= 121 && y < 151) {
+      hysteresisHigh = constrain(hysteresisHigh + d, 0.1f, 3.0f);
+    } else if (y >= 151 && y < 181) {
+      calibrationOffset = constrain(calibrationOffset + d, -5.0f, 5.0f);
+    } else if (y >= 181 && y <= 230) {
+      targetStep = targetStep < 0.5f ? 0.5f : 0.1f;
+    } else return;
+    saveThermostatSettings(); redrawScreen=true; return;
+  }
+  if (settingsPage == 2) {
+    if (y >= 60 && y < 91) displayBrightness = constrain(displayBrightness + (x < 160 ? -15 : 15), 10, 255);
+    else if (y >= 91 && y < 121) nightModeEnabled = !nightModeEnabled;
+    else if (y >= 121 && y < 151) nightBrightness = constrain(nightBrightness + (x < 160 ? -10 : 10), 10, 255);
+    else if (y >= 151 && y < 181) dimTimeoutSeconds = (dimTimeoutSeconds >= 60) ? 15 : dimTimeoutSeconds + 15;
+    else return;
+    saveBrightness(); saveThermostatSettings(); updateBrightnessMode(); redrawScreen=true; return;
+  }
+  if (settingsPage == 5 && y >= 160 && y <= 215) { startRelayTest(); redrawScreen=true; return; }
+  if (settingsPage == 4 && y >= 185) {
+    // Reset Wi-Fi is available on the web interface to avoid accidental reset from a tap.
+    redrawScreen=true;
   }
 }
 
 void checkHeating() {
-  if (!heatingOn && currentTemp <= targetTemp - hysteresisLow) {
-    heatingOn = true;
-    digitalWrite(RELAY_PIN, LOW);
-  }
-  if (heatingOn && currentTemp >= targetTemp + hysteresisHigh) {
+  // При недостоверном датчике отключаем отопление; тест реле ограничен по времени.
+  if (!sensorValid) {
+    relayTestActive = false;
     heatingOn = false;
     digitalWrite(RELAY_PIN, HIGH);
+    return;
+  }
+  if (relayTestActive) {
+    if ((long)(millis() - relayTestUntil) >= 0) {
+      relayTestActive = false;
+      heatingOn = relayStateBeforeTest;
+      digitalWrite(RELAY_PIN, heatingOn ? LOW : HIGH);
+    }
+    return;
+  }
+  if (!heatingOn && currentTemp <= targetTemp - hysteresisLow) {
+    heatingOn = true; digitalWrite(RELAY_PIN, LOW);
+  } else if (heatingOn && currentTemp >= targetTemp + hysteresisHigh) {
+    heatingOn = false; digitalWrite(RELAY_PIN, HIGH);
   }
 }
 
@@ -512,8 +791,13 @@ void setupWiFi() {
 
 void readTemperature() {
   sensors.requestTemperatures();
-  float temp = sensors.getTempCByIndex(0);
-  if (!isnan(temp)) currentTemp = temp;
+  float raw = sensors.getTempCByIndex(0);
+  sensorValid = isfinite(raw) && raw != DEVICE_DISCONNECTED_C && raw >= -55.0f && raw <= 125.0f;
+  if (sensorValid) currentTemp = raw + calibrationOffset;
+  else {
+    heatingOn = false;
+    digitalWrite(RELAY_PIN, HIGH);
+  }
 }
 
 void saveTargetTemp() { EEPROM.put(TARGET_TEMP_ADDR, targetTemp); EEPROM.commit(); }
@@ -578,6 +862,8 @@ bool mqttConnect() {
 
 void loop() {
   checkTouch();
+  updateBrightnessMode();
+  if (relayTestActive && (long)(millis() - relayTestUntil) >= 0) checkHeating();
   if (currentScreen == 0) drawHomeScreen();
   else drawSettingsScreen();
 
@@ -600,7 +886,7 @@ void loop() {
   if (millis() - lastPublish >= publishInterval) {
     lastPublish = millis();
     if (mqttClient.connected()) {
-      mqttClient.publish(tempTopic, String(currentTemp, 1).c_str(), true);
+      mqttClient.publish(tempTopic, sensorValid ? String(currentTemp, 1).c_str() : "ERROR", true);
       mqttClient.publish(relayStatusTopic, heatingOn ? "ON" : "OFF", true);
     }
   }
