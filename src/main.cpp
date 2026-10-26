@@ -170,7 +170,7 @@ int displayBrightness = 255;
 // NTP
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
-const int daylightOffset_sec = 3600; // летнее время для Чехии
+const int daylightOffset_sec = 0; // летнее время для Чехии
 
 // Прототипы
 void drawHomeScreen();
