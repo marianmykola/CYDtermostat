@@ -18,7 +18,7 @@
 #include <HTTPClient.h>
 
 // Подключаем шрифты Ubuntu
-#include "FreeSansBold16pt7b.h"
+#include "FreeSansBold32pt7b.h"
 #include "FreeSansBold36pt7b.h"
 #include "Ubuntu_Bold7pt7b.h"
 #include "Ubuntu_Bold9pt7b.h"
@@ -69,6 +69,9 @@ String weatherTemp = "";
 String weatherDesc = "";
 String oldWeatherTemp = "";
 String oldWeatherDesc = "";
+uint8_t weatherIconType = 0; // 0=unknown, 1=sun, 2=cloud, 3=rain, 4=snow, 5=storm, 6=fog
+uint8_t oldWeatherIconType = 255;
+uint8_t timeMode = 0; // 0=automatic Czech DST, 1=winter time, 2=summer time
 
 WiFiManager wm;
 WebServer server(80);
@@ -95,6 +98,7 @@ DallasTemperature sensors(&oneWire);
 #define SETTINGS_CONFIG_ADDR 300
 #define MQTT_FULL_CONFIG_ADDR 360
 #define TOUCH_CALIBRATION_ADDR 496  // reserved gap after MQTT settings; fits within EEPROM(512)
+#define TIME_MODE_ADDR 508          // one byte: 0=automatic, 1=winter, 2=summer
 
 // ШИМ подсветки
 #define LEDC_CHANNEL 0
@@ -170,7 +174,7 @@ int displayBrightness = 255;
 // NTP
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
-const int daylightOffset_sec = 0; // летнее время для Чехии
+const int daylightOffset_sec = 3600; // летнее время для Чехии
 
 // Прототипы
 void drawHomeScreen();
@@ -227,6 +231,7 @@ const char* webPage = R"rawliteral(
     <div class="title" id="time">--:--:--</div>
     <div class="bigtemp" id="temp">--.- °C</div>
     <div class="target">Cílová teplota: <b><span id="target">--.-</span> °C</b></div>
+    <div class="status" id="weather">🌤️ Načítám počasí…</div>
     <div class="row"><button class="btn blue" onclick="changeTemp('inc')">+0,5 °C</button><button class="btn" onclick="changeTemp('dec')">−0,5 °C</button></div>
     <div class="status" id="liveStatus">Načítám stav…</div>
   </div>
@@ -239,6 +244,8 @@ const char* webPage = R"rawliteral(
     <div class="field"><div class="rangehead"><span>Jas displeje</span><b id="brightVal">100%</b></div><input id="brightness" type="range" min="10" max="255" value="255" oninput="document.getElementById('brightVal').textContent=Math.round(this.value/255*100)+'%'"></div>
     <div class="checkrow"><input id="nightMode" type="checkbox"><label for="nightMode">Noční režim (22:00–06:00)</label></div>
     <div class="field"><div class="rangehead"><span>Noční jas</span><b id="nightVal">14%</b></div><input id="nightBrightness" type="range" min="10" max="255" value="35" oninput="document.getElementById('nightVal').textContent=Math.round(this.value/255*100)+'%'"></div>
+    <div class="field"><label>Letní / zimní čas</label><select id="timeMode"><option value="0">Automaticky podle Česka (doporučeno)</option><option value="1">Vždy zimní čas (UTC+1)</option><option value="2">Vždy letní čas (UTC+2)</option></select></div>
+    <p class="note">Automatický režim přepíná čas podle platných pravidel pro Českou republiku.</p>
     <div class="field"><label>Automatické ztlumení po nečinnosti (sekundy, 5–600)</label><input id="dimTimeout" type="number" min="5" max="600" step="5"></div>
     <p class="note">Krok změny cílové teploty je pevně nastaven na 0,5 °C.</p>
     <button class="btn" onclick="saveSettings()">Uložit nastavení</button><div class="msg" id="settingsMsg"></div>
@@ -265,13 +272,13 @@ const char* webPage = R"rawliteral(
 <script>
 let loaded=false;
 async function fetchStatus(){try{const r=await fetch('/status',{cache:'no-store'});const j=await r.json();
- document.getElementById('temp').textContent=(j.sensorOk?Number(j.temp).toFixed(1):'--.-')+' °C';document.getElementById('target').textContent=Number(j.target).toFixed(1);document.getElementById('time').textContent=j.time;
+ document.getElementById('temp').textContent=(j.sensorOk?Number(j.temp).toFixed(1):'--.-')+' °C';document.getElementById('target').textContent=Number(j.target).toFixed(1);document.getElementById('time').textContent=j.time;document.getElementById('weather').textContent=j.weatherEmoji+' '+j.weatherTemp+' '+j.weatherDesc;
  document.getElementById('liveStatus').textContent='Topení: '+(j.relay==='ON'?'ZAPNUTO':'VYPNUTO')+' · Čidlo: '+(j.sensorOk?'OK':'CHYBA')+' · Wi-Fi: '+(j.wifi?'připojena':'odpojena')+' · MQTT: '+(j.mqtt?'připojeno':'odpojeno');
  document.getElementById('diagnostics').innerHTML='Čidlo: <b>'+(j.sensorOk?'OK':'CHYBA')+'</b><br>Relé: <b>'+j.relay+'</b><br>Wi-Fi: '+(j.wifi?'připojena':'odpojena')+' · RSSI: '+j.rssi+' dBm<br>MQTT: '+(j.mqtt?'připojeno':'odpojeno')+'<br>IP: '+j.ip+'<br>Doba běhu: '+j.uptime+' min';document.getElementById('ip').textContent=j.ip;
- if(!loaded){document.getElementById('hLow').value=j.hLow;document.getElementById('hHigh').value=j.hHigh;document.getElementById('offset').value=j.offset;document.getElementById('brightness').value=j.brightness;document.getElementById('brightVal').textContent=Math.round(j.brightness/255*100)+'%';document.getElementById('nightMode').checked=j.nightMode;document.getElementById('nightBrightness').value=j.nightBrightness;document.getElementById('nightVal').textContent=Math.round(j.nightBrightness/255*100)+'%';document.getElementById('dimTimeout').value=j.dimTimeout;document.getElementById('mqttServer').value=j.mqttServer;document.getElementById('mqttPort').value=j.mqttPort;document.getElementById('mqttUser').value=j.mqttUser;loaded=true;}
+ if(!loaded){document.getElementById('hLow').value=j.hLow;document.getElementById('hHigh').value=j.hHigh;document.getElementById('offset').value=j.offset;document.getElementById('brightness').value=j.brightness;document.getElementById('brightVal').textContent=Math.round(j.brightness/255*100)+'%';document.getElementById('nightMode').checked=j.nightMode;document.getElementById('nightBrightness').value=j.nightBrightness;document.getElementById('nightVal').textContent=Math.round(j.nightBrightness/255*100)+'%';document.getElementById('dimTimeout').value=j.dimTimeout;document.getElementById('timeMode').value=j.timeMode;document.getElementById('mqttServer').value=j.mqttServer;document.getElementById('mqttPort').value=j.mqttPort;document.getElementById('mqttUser').value=j.mqttUser;loaded=true;}
  }catch(e){document.getElementById('liveStatus').textContent='Nepodařilo se načíst stav zařízení.'}}
 async function changeTemp(action){await fetch('/'+action,{method:'POST'});fetchStatus()}
-async function saveSettings(){const data=new URLSearchParams({hLow:document.getElementById('hLow').value,hHigh:document.getElementById('hHigh').value,offset:document.getElementById('offset').value,brightness:document.getElementById('brightness').value,nightMode:document.getElementById('nightMode').checked?'1':'0',nightBrightness:document.getElementById('nightBrightness').value,dimTimeout:document.getElementById('dimTimeout').value});const r=await fetch('/save-settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data});document.getElementById('settingsMsg').textContent=r.ok?'Nastavení uloženo.':'Chyba: zkontrolujte zadané hodnoty.';if(r.ok){loaded=false;fetchStatus()}}
+async function saveSettings(){const data=new URLSearchParams({hLow:document.getElementById('hLow').value,hHigh:document.getElementById('hHigh').value,offset:document.getElementById('offset').value,brightness:document.getElementById('brightness').value,nightMode:document.getElementById('nightMode').checked?'1':'0',nightBrightness:document.getElementById('nightBrightness').value,dimTimeout:document.getElementById('dimTimeout').value,timeMode:document.getElementById('timeMode').value});const r=await fetch('/save-settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data});document.getElementById('settingsMsg').textContent=r.ok?'Nastavení uloženo.':'Chyba: zkontrolujte zadané hodnoty.';if(r.ok){loaded=false;fetchStatus()}}
 async function relayTest(){const r=await fetch('/relay-test',{method:'POST'});document.getElementById('serviceMsg').textContent=r.ok?'Test relé spuštěn na 3 sekundy.':await r.text();fetchStatus()}
 document.getElementById('mqttForm').addEventListener('submit',async e=>{e.preventDefault();const data=new URLSearchParams(new FormData(e.target));const r=await fetch('/mqtt-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data});document.getElementById('netMsg').textContent=r.ok?'MQTT nastavení uloženo.':'Chyba ukládání MQTT.';if(r.ok){document.getElementById('mqttPassword').value='';loaded=false;fetchStatus()}});
 async function resetWifi(){if(confirm('Zařízení se restartuje a znovu otevře Wi-Fi konfigurační portál. Pokračovat?')){await fetch('/wifi-reset',{method:'POST'});document.getElementById('netMsg').textContent='Zařízení se restartuje.'}}
@@ -291,6 +298,8 @@ void setup() {
   loadThermostatSettings();
   loadFullMqttConfig();
   loadTouchCalibration();
+  uint8_t storedTimeMode = EEPROM.read(TIME_MODE_ADDR);
+  timeMode = (storedTimeMode <= 2) ? storedTimeMode : 0;
   bootMillis = millis();
   lastTouchMillis = millis();
   
@@ -332,6 +341,10 @@ void setupWebServer() {
       ",\"relay\":\"" + String(heatingOn ? "ON" : "OFF") + "\"" +
       ",\"target\":" + String(targetTemp, 1) +
       ",\"time\":\"" + getCurrentTime() + "\"" +
+      ",\"timeMode\":" + String(timeMode) +
+      ",\"weatherEmoji\":\"" + String(weatherIconType == 1 ? "☀️" : weatherIconType == 2 ? "☁️" : weatherIconType == 3 ? "🌧️" : weatherIconType == 4 ? "❄️" : weatherIconType == 5 ? "⛈️" : weatherIconType == 6 ? "🌫️" : "🌦️") + "\"" +
+      ",\"weatherTemp\":\"" + weatherTemp + "\"" +
+      ",\"weatherDesc\":\"" + weatherDesc + "\"" +
       ",\"brightness\":" + String(displayBrightness) +
       ",\"hLow\":" + String(hysteresisLow, 1) +
       ",\"hHigh\":" + String(hysteresisHigh, 1) +
@@ -372,7 +385,7 @@ void setupWebServer() {
   });
   server.on("/save-settings", HTTP_POST, []() {
     if (!server.hasArg("hLow") || !server.hasArg("hHigh") || !server.hasArg("offset") ||
-        !server.hasArg("brightness") || !server.hasArg("nightBrightness") || !server.hasArg("dimTimeout")) {
+        !server.hasArg("brightness") || !server.hasArg("nightBrightness") || !server.hasArg("dimTimeout") || !server.hasArg("timeMode")) {
       server.send(400, "text/plain", "Chybí povinné hodnoty"); return;
     }
     float low = server.arg("hLow").toFloat();
@@ -381,14 +394,18 @@ void setupWebServer() {
     int bright = server.arg("brightness").toInt();
     int nightBright = server.arg("nightBrightness").toInt();
     int dim = server.arg("dimTimeout").toInt();
+    int requestedTimeMode = server.arg("timeMode").toInt();
     if (!isfinite(low) || low < 0.1f || low > 3.0f || !isfinite(high) || high < 0.1f || high > 3.0f ||
         !isfinite(offset) || offset < -5.0f || offset > 5.0f || bright < 10 || bright > 255 ||
-        nightBright < 10 || nightBright > 255 || dim < 5 || dim > 600) {
+        nightBright < 10 || nightBright > 255 || dim < 5 || dim > 600 || requestedTimeMode < 0 || requestedTimeMode > 2) {
       server.send(400, "text/plain", "Hodnoty mimo povolený rozsah"); return;
     }
     hysteresisLow = low; hysteresisHigh = high; calibrationOffset = offset;
     displayBrightness = bright; nightBrightness = nightBright; dimTimeoutSeconds = dim;
     nightModeEnabled = server.hasArg("nightMode") && server.arg("nightMode") == "1";
+    timeMode = (uint8_t)requestedTimeMode;
+    EEPROM.write(TIME_MODE_ADDR, timeMode); EEPROM.commit();
+    setupTime();
     targetStep = 0.5f; // Fixed step: always half a degree.
     saveBrightness(); saveThermostatSettings(); readTemperature(); updateBrightnessMode();
     server.send(200, "text/plain", "ok");
@@ -512,6 +529,45 @@ void startRelayTest() {
   digitalWrite(RELAY_PIN, heatingOn ? LOW : HIGH);
 }
 
+void drawWeatherIcon(int cx, int cy, uint8_t type) {
+  // Compact pixel-art icons sized for the weather card on the 320x240 CYD.
+  const uint16_t sun = 0xFFE0, cloud = 0xC618, rain = 0x07FF, snow = 0xFFFF, storm = 0xFD20;
+  if (type == 1) { // clear / sun
+    tft.fillCircle(cx, cy, 7, sun);
+    for (int a = 0; a < 8; ++a) {
+      float ang = a * 0.785398f;
+      int x1 = cx + (int)(10 * cosf(ang)), y1 = cy + (int)(10 * sinf(ang));
+      int x2 = cx + (int)(13 * cosf(ang)), y2 = cy + (int)(13 * sinf(ang));
+      tft.drawLine(x1, y1, x2, y2, sun);
+    }
+  } else if (type == 2 || type == 3 || type == 4 || type == 5 || type == 6) {
+    // Cloud body
+    tft.fillCircle(cx - 5, cy - 1, 6, cloud);
+    tft.fillCircle(cx + 2, cy - 5, 8, cloud);
+    tft.fillCircle(cx + 9, cy, 5, cloud);
+    tft.fillRoundRect(cx - 9, cy - 1, 21, 8, 4, cloud);
+    if (type == 3) {
+      tft.drawLine(cx - 5, cy + 9, cx - 7, cy + 13, rain);
+      tft.drawLine(cx + 2, cy + 9, cx, cy + 13, rain);
+      tft.drawLine(cx + 9, cy + 9, cx + 7, cy + 13, rain);
+    } else if (type == 4) {
+      tft.drawLine(cx - 5, cy + 9, cx - 5, cy + 14, snow); tft.drawLine(cx - 8, cy + 11, cx - 2, cy + 12, snow);
+      tft.drawLine(cx + 4, cy + 9, cx + 4, cy + 14, snow); tft.drawLine(cx + 1, cy + 11, cx + 7, cy + 12, snow);
+    } else if (type == 5) {
+      tft.fillTriangle(cx + 1, cy + 6, cx - 3, cy + 13, cx + 1, cy + 12, storm);
+      tft.fillTriangle(cx + 1, cy + 12, cx + 6, cy + 7, cx + 2, cy + 8, storm);
+    } else if (type == 6) {
+      tft.drawFastHLine(cx - 12, cy + 10, 24, cloud);
+      tft.drawFastHLine(cx - 10, cy + 13, 20, cloud);
+    }
+  } else { // unknown / drizzle: simple cloud with drops
+    tft.fillCircle(cx - 5, cy - 1, 6, cloud); tft.fillCircle(cx + 2, cy - 5, 8, cloud);
+    tft.fillCircle(cx + 9, cy, 5, cloud); tft.fillRoundRect(cx - 9, cy - 1, 21, 8, 4, cloud);
+    tft.drawLine(cx - 4, cy + 9, cx - 6, cy + 12, rain);
+    tft.drawLine(cx + 4, cy + 9, cx + 2, cy + 12, rain);
+  }
+}
+
 void drawHomeScreen() {
   if (redrawScreen) {
     tft.fillScreen(DARK_BG);
@@ -582,7 +638,7 @@ void drawHomeScreen() {
   // Комнатная температура.
   if (abs(currentTemp - oldTemp) > 0.05) {
     tft.fillRect(15, 104, 95, 34, CARD_BG);
-    tft.setFreeFont(&FreeSansBold16pt7b);
+    tft.setFreeFont(&Ubuntu_Bold12pt7b);
     tft.setTextColor(0x07FF, CARD_BG);
     tft.drawCentreString(String(currentTemp, 1) + " C", 62, 108, 1);
     oldTemp = currentTemp;
@@ -591,7 +647,7 @@ void drawHomeScreen() {
   // Целевая температура.
   if (abs(targetTemp - oldTarget) > 0.05) {
     tft.fillRect(127, 104, 103, 34, CARD_BG);
-    tft.setFreeFont(&FreeSansBold16pt7b);
+    tft.setFreeFont(&Ubuntu_Bold12pt7b);
     tft.setTextColor(0xFFE0, CARD_BG);
     tft.drawCentreString(String(targetTemp, 1) + " C", 178, 108, 1);
     oldTarget = targetTemp;
@@ -624,14 +680,18 @@ void drawHomeScreen() {
     oldMqttConnected = mqttOk;
   }
 
-  // Погода.
-  if (weatherTemp != oldWeatherTemp || weatherDesc != oldWeatherDesc) {
-    tft.fillRect(15, 190, 215, 27, CARD_BG);
+  // Погода с пиктограммой, соответствующей коду OpenWeather.
+  if (weatherTemp != oldWeatherTemp || weatherDesc != oldWeatherDesc || weatherIconType != oldWeatherIconType) {
+    tft.fillRect(13, 187, 219, 33, CARD_BG);
+    drawWeatherIcon(32, 202, weatherIconType);
     tft.setFreeFont(&Ubuntu_Bold9pt7b);
     tft.setTextColor(TFT_WHITE, CARD_BG);
-    tft.drawCentreString(weatherTemp + "   " + weatherDesc, 122, 196, 1);
+    String weatherLine = weatherTemp + "  " + weatherDesc;
+    if (weatherLine.length() > 24) weatherLine = weatherLine.substring(0, 23) + "…";
+    tft.drawCentreString(weatherLine, 140, 196, 1);
     oldWeatherTemp = weatherTemp;
     oldWeatherDesc = weatherDesc;
+    oldWeatherIconType = weatherIconType;
   }
 }
 void drawSettingsScreen() {
@@ -1000,7 +1060,15 @@ void processTouchCalibration(TouchPoint p) {
 
 void saveTargetTemp() { EEPROM.put(TARGET_TEMP_ADDR, targetTemp); EEPROM.commit(); }
 void loadTargetTemp() { EEPROM.get(TARGET_TEMP_ADDR, targetTemp); if (isnan(targetTemp) || targetTemp < 5.0 || targetTemp > 35.0) targetTemp = 22.0; }
-void setupTime() { configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); }
+void setupTime() {
+  // POSIX TZ rules for Czechia: CET/CEST changes automatically on the last Sundays of March and October.
+  const char* tz = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+  if (timeMode == 1) tz = "CET-1";       // fixed UTC+1
+  else if (timeMode == 2) tz = "CEST-2"; // fixed UTC+2
+  setenv("TZ", tz, 1);
+  tzset();
+  configTime(0, 0, ntpServer);
+}
 
 String getCurrentTime() {
   struct tm timeinfo;
@@ -1030,10 +1098,19 @@ void fetchWeather() {
   if (http.GET() == 200) {
     DynamicJsonDocument doc(1500);
     deserializeJson(doc, http.getString());
-    float temp = doc["main"]["temp"];
-    const char* desc = doc["weather"][0]["description"];
+    float temp = doc["main"]["temp"] | 0.0f;
+    int weatherId = doc["weather"][0]["id"] | 0;
+    const char* desc = doc["weather"][0]["description"] | "pocasi";
     weatherTemp = String(temp, 1) + "C";
-    weatherDesc = removeDiacritics(String(desc)); 
+    weatherDesc = removeDiacritics(String(desc));
+    if (weatherId == 800) weatherIconType = 1;                 // jasno
+    else if (weatherId == 801) weatherIconType = 2;            // skoro jasno
+    else if (weatherId >= 802 && weatherId <= 804) weatherIconType = 2; // oblacno
+    else if (weatherId >= 200 && weatherId < 300) weatherIconType = 5;  // bourky
+    else if ((weatherId >= 300 && weatherId < 400) || (weatherId >= 500 && weatherId < 600)) weatherIconType = 3; // dest
+    else if (weatherId >= 600 && weatherId < 700) weatherIconType = 4; // snih
+    else if (weatherId >= 700 && weatherId < 800) weatherIconType = 6; // mlha
+    else weatherIconType = 0;
   }
   http.end();
 }
